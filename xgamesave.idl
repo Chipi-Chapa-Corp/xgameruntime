@@ -118,12 +118,48 @@ interface IXGameSaveImpl3 : IXGameSaveImpl2
 {
 }
 
+/* IXGameSaveImpl4 appends the PFXGameSave methods. Slot numbers follow the
+ * Microsoft.GDK.PC 2510.3.6286 XGameSave/PFXGameSave headers: the methods
+ * inherited from IXGameSaveImpl3 keep slots 3-32, and the seventeen PFXGameSave
+ * methods take slots 33-49. A title may ask for this revision before its legacy
+ * save calls, so the complete layout is exposed even though PlayFab cloud
+ * storage itself is unsupported. */
+typedef struct PFXGameSaveConfig *PFXGameSaveConfigHandle;
+struct PFXGameSaveConfigRequest;
+struct PFXGameSaveUiCallbacks;
+
+[
+    local,
+    object,
+    uuid(ab4ae4fb-6508-4950-a032-45fd4bf8c43b)
+]
+interface IXGameSaveImpl4 : IXGameSaveImpl3
+{
+    HRESULT PFXGameSaveInitializeConfig( [in] struct PFXGameSaveConfigRequest *request, [out] PFXGameSaveConfigHandle *config );
+    void PFXGameSaveFreeConfig( [in] PFXGameSaveConfigHandle config );
+    HRESULT PFXGameSaveFilesGetFolderWithUiAsync( [in] PFXGameSaveConfigHandle config, [in, out] XAsyncBlock *async );
+    HRESULT PFXGameSaveFilesGetFolderWithUiResult( [in, out] XAsyncBlock *async, [in] SIZE_T folderSize, [out, size_is(folderSize)] char *folderResult );
+    HRESULT PFXGameSaveFilesGetRemainingQuota( [in] PFXGameSaveConfigHandle config, [out] INT64 *remainingQuota );
+    HRESULT PFXGameSaveSetUiCallbacks( [in] struct PFXGameSaveUiCallbacks *callbacks );
+    HRESULT PFXGameSaveProgressUiGetProgress( [in] XUserHandle user, [out] UINT32 *syncState, [out] UINT64 *current, [out] UINT64 *total );
+    HRESULT PFXGameSaveSetProgressUiResponse( [in] XUserHandle user, [in] UINT32 response );
+    HRESULT PFXGameSaveSetSyncFailedUiResponse( [in] XUserHandle user, [in] UINT32 response );
+    HRESULT PFXGameSaveSetActiveDeviceContentionUiResponse( [in] XUserHandle user, [in] UINT32 response );
+    HRESULT PFXGameSaveSetConflictUiResponse( [in] XUserHandle user, [in] UINT32 response );
+    HRESULT PFXGameSaveSetOutOfStorageUiResponse( [in] XUserHandle user, [in] UINT32 response );
+    HRESULT PFXGameSaveFilesUploadWithUiAsync( [in] PFXGameSaveConfigHandle config, [in] UINT32 options, [in, out] XAsyncBlock *async );
+    HRESULT PFXGameSaveFilesUploadWithUiResult( [in, out] XAsyncBlock *async );
+    HRESULT PFXGameSaveFilesSetSaveDescriptionAsync( [in] PFXGameSaveConfigHandle config, [in, string] const char *description, [in, out] XAsyncBlock *async );
+    HRESULT PFXGameSaveFilesSetSaveDescriptionResult( [in, out] XAsyncBlock *async );
+    HRESULT PFXGameSaveSetActiveDeviceChangedCallback( [in] void *callback, [in] void *context );
+}
+
 [
     uuid(704c3f58-e629-4cc2-b197-30511b996fe2)
 ]
 coclass XGameSaveImpl
 {
-    [default] interface IXGameSaveImpl3;
+    [default] interface IXGameSaveImpl4;
 }
 
 cpp_quote("#endif")
