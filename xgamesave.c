@@ -601,6 +601,32 @@ static BOOL scid_to_suffix( const char *scid, WCHAR out[33] )
     return n == 32 && !*scid;
 }
 
+/* The SCID a title's saves belong to, when the title does not say.
+ *
+ * Forza Horizon 5 initialises its provider with an all-zero configuration id,
+ * which in the GDK means "the one this title was built with" rather than a
+ * service configuration whose every digit is zero. Taking it literally puts
+ * the saves under a folder named for a zero SCID, so a profile the player
+ * already has -- copied from Windows, or written by an earlier run -- is
+ * invisible, and the title starts as though it had never been played.
+ *
+ * The default follows the convention every Xbox title id-scoped SCID uses:
+ * the last eight digits are the title id, everything before them zero. */
+static BOOL title_default_suffix( WCHAR out[33] )
+{
+    char hex[32];
+
+    if (!xgr_config_element( "TitleId", hex, sizeof(hex) ) || !hex[0]) return FALSE;
+    swprintf( out, 33, L"000000000000000000000000%08lX", strtoul( hex, NULL, 16 ) );
+    return TRUE;
+}
+
+static BOOL suffix_all_zero( const WCHAR *suffix )
+{
+    while (*suffix) if (*suffix++ != '0') return FALSE;
+    return TRUE;
+}
+
 /* The per-user folder for a service configuration. An existing folder with
  * the right SCID suffix wins whatever XUID it carries, which is how a save
  * copied over from Windows is picked up; otherwise one is named after the
@@ -612,6 +638,10 @@ static WCHAR *resolve_user_dir( const WCHAR *root, const char *scid )
     HANDLE find;
 
     if (!scid_to_suffix( scid, suffix )) return NULL;
+    /* a title with no id in its config keeps the zero suffix; there is nothing
+     * better to say, and refusing to open a provider would be worse */
+    if (suffix_all_zero( suffix ) && title_default_suffix( suffix ))
+        TRACE( "title named no service configuration; using its own, %s.\n", debugstr_w( suffix ) );
     swprintf( leaf, ARRAY_SIZE(leaf), L"*_%s", suffix );
     if (!(pattern = path_join( root, leaf ))) return NULL;
     find = FindFirstFileW( pattern, &data );

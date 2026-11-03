@@ -127,6 +127,15 @@ WCHAR *xgr_package_root( void );
 /* MicrosoftGame.config text (inline or from disk; UTF-8, malloc'd, or NULL). */
 char *xgr_load_game_config( void );
 
+/* Read one value out of MicrosoftGame.config, which is parsed and cached once
+ * in xpackage.c: the text of <element>text</element>, or attr="value" from the
+ * first <element ...> found. FALSE, and an empty `out`, if it is not there.
+ * The config is the only description of the title we have offline, so what a
+ * package, a store product and a save folder say about it all comes from
+ * here and therefore agrees. */
+BOOL xgr_config_element( const char *element, char *out, SIZE_T cap );
+BOOL xgr_config_attr( const char *element, const char *attr, char *out, SIZE_T cap );
+
 /* The running title's identity for Xbox authentication, from its
  * MicrosoftGame.config: `TitleId` (rendered decimal, since the config carries
  * it in hexadecimal and Xbox wants decimal) and `MSAAppId`. Either comes back

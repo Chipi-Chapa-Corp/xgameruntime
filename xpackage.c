@@ -122,8 +122,8 @@ static const char *game_config( void )
     return cached;
 }
 
-/* Pull the text of <element>text</element> from MicrosoftGame.config. */
-static BOOL config_element( const char *element, char *out, SIZE_T cap )
+/* See private.h: the text of <element>text</element> in MicrosoftGame.config. */
+BOOL xgr_config_element( const char *element, char *out, SIZE_T cap )
 {
     const char *xml = game_config(), *value;
     char tag[64];
@@ -150,13 +150,13 @@ void xgr_title_identity( char *title_id, SIZE_T title_id_len, char *client_id, S
     /* The config spells TitleId in hexadecimal ("69C7AA31"); every Xbox service
      * and the token endpoints want it decimal, so convert here rather than
      * leaving each caller to guess which form it is holding. */
-    if (config_element( "TitleId", hex, sizeof(hex) ) && hex[0])
+    if (xgr_config_element( "TitleId", hex, sizeof(hex) ) && hex[0])
         snprintf( title_id, title_id_len, "%lu", strtoul( hex, NULL, 16 ) );
-    config_element( "MSAAppId", client_id, client_id_len );
+    xgr_config_element( "MSAAppId", client_id, client_id_len );
 }
 
-/* Pull attr="value" from the first <element ...> in MicrosoftGame.config. */
-static BOOL config_attr( const char *element, const char *attr, char *out, SIZE_T cap )
+/* See private.h: attr="value" from the first <element ...> in MicrosoftGame.config. */
+BOOL xgr_config_attr( const char *element, const char *attr, char *out, SIZE_T cap )
 {
     const char *xml = game_config(), *start, *end, *value;
     SIZE_T len;
@@ -193,7 +193,7 @@ static void fill_current_details( XPackageDetails *details, char *identifier, ch
     details->index = 0;
     details->count = 1;
 
-    if (config_attr( "<Identity", " Version=\"", version, sizeof(version) ))
+    if (xgr_config_attr( "<Identity", " Version=\"", version, sizeof(version) ))
     {
         unsigned int a = 0, b = 0, c = 0, d = 0;
         sscanf( version, "%u.%u.%u.%u", &a, &b, &c, &d );
@@ -501,15 +501,15 @@ static HRESULT enumerate_current( XPackageKind kind, void *context, XPackageEnum
      * name as the display name and blanks for the rest is not harmless: a title
      * looking for itself in the list it just asked for will not recognise the
      * entry, and the ones that key on storeId find nothing at all. */
-    if (!config_attr( "<ShellVisuals", " DefaultDisplayName=\"", display, sizeof(display) ) || !display[0])
-        if (!config_attr( "<Identity", " Name=\"", display, sizeof(display) ))
+    if (!xgr_config_attr( "<ShellVisuals", " DefaultDisplayName=\"", display, sizeof(display) ) || !display[0])
+        if (!xgr_config_attr( "<Identity", " Name=\"", display, sizeof(display) ))
             strcpy( display, "Game" );
-    if (!config_attr( "<ShellVisuals", " Description=\"", description, sizeof(description) ) || !description[0])
+    if (!xgr_config_attr( "<ShellVisuals", " Description=\"", description, sizeof(description) ) || !description[0])
         strcpy( description, display );
-    if (!config_attr( "<ShellVisuals", " PublisherDisplayName=\"", publisher, sizeof(publisher) ))
+    if (!xgr_config_attr( "<ShellVisuals", " PublisherDisplayName=\"", publisher, sizeof(publisher) ))
         publisher[0] = 0;
-    if (!config_element( "StoreId", store_id, sizeof(store_id) )) store_id[0] = 0;
-    if (!config_element( "TitleId", title_id, sizeof(title_id) )) title_id[0] = 0;
+    if (!xgr_config_element( "StoreId", store_id, sizeof(store_id) )) store_id[0] = 0;
+    if (!xgr_config_element( "TitleId", title_id, sizeof(title_id) )) title_id[0] = 0;
 
     fill_current_details( &details, identifier, display, description, publisher, store_id, title_id );
     TRACE( "reporting package %s (%s), store %s, title %s\n", debugstr_a( identifier ),
