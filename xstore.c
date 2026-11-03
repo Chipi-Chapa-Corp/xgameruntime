@@ -19,7 +19,10 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "private.h"
+#include "unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
@@ -27,8 +30,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
  * Store, from the point of view of one locally-installed, fully-owned game
  * playing offline: the base game licence is active and perpetual, there are no
  * add-ons or entitled products, nothing is a trial, and no updates are pending.
- * The server-backed identifiers (collections id, purchase id, licence token)
+ * The server-backed identifiers (collections id, purchase id)
  * come back empty, which is correct for a title that never reaches Xbox Live.
+ * Licence tokens are fetched asynchronously by the credential-owning service.
  * These are the answers that let a title get past its startup licence check
  * instead of dying on an E_NOTIMPL.
  */
@@ -510,35 +514,95 @@ static HRESULT WINAPI x_store_XStoreGetUserPurchaseIdResult( IXStoreImpl6 *iface
     return hr;
 }
 
+static const char license_token_identity;
+
+static void license_token_free( struct license_token_params *params )
+{
+    unsigned int i;
+    for (i = 0; i < params->count; i++) free( (void *)params->ids[i] );
+    free( params->ids );
+    free( (void *)params->custom );
+    free( params );
+}
+
+static HRESULT CALLBACK license_token_provider( XAsyncOp op, const XAsyncProviderData *data )
+{
+    struct license_token_params *params = data->context;
+    NTSTATUS status;
+    HRESULT hr;
+
+    switch (op)
+    {
+    case XAsyncOp_Begin:
+        return IXThreadingImpl_XAsyncSchedule( x_threading_impl, data->async, 0 );
+    case XAsyncOp_DoWork:
+        status = XGR_UNIX_CALL( license_token, params );
+        hr = status == STATUS_IO_TIMEOUT ? HRESULT_FROM_WIN32( ERROR_TIMEOUT ) :
+             status ? HRESULT_FROM_WIN32( ERROR_NOT_FOUND ) : S_OK;
+        IXThreadingImpl_XAsyncComplete( x_threading_impl, data->async, hr,
+                                        SUCCEEDED(hr) ? strlen(params->token) + 1 : 0 );
+        /* Completion may release the context on another thread. */
+        return E_PENDING;
+    case XAsyncOp_GetResult:
+        memcpy( data->buffer, params->token, strlen(params->token) + 1 );
+        return S_OK;
+    case XAsyncOp_Cleanup:
+        license_token_free( params );
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
 static HRESULT WINAPI x_store_XStoreQueryLicenseTokenAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char **productIds, SIZE_T productIdsCount, const char *customDeveloperString, XAsyncBlock *async )
 {
-    TRACE( "iface %p, storeContextHandle %p, productIdsCount %Iu, customDeveloperString %s, async %p.\n",
-           iface, storeContextHandle, productIdsCount, debugstr_a( customDeveloperString ), async );
-    if (!async) return E_INVALIDARG;
-    xgr_async_complete( async, S_OK, NULL );
-    return S_OK;
+    struct license_token_params *params;
+    SIZE_T i, j, size;
+    HRESULT hr;
+
+    TRACE( "iface %p, context %p, count %Iu, async %p.\n", iface, storeContextHandle, productIdsCount, async );
+    if (!async || !storeContextHandle || !customDeveloperString || !customDeveloperString[0] ||
+        strnlen( customDeveloperString, 16385 ) > 16384 || productIdsCount > 256 ||
+        (productIdsCount && !productIds)) return E_INVALIDARG;
+    for (i = 0; i < productIdsCount; i++)
+    {
+        if (!productIds[i] || !(size = strnlen(productIds[i], 65)) || size > 64) return E_INVALIDARG;
+        for (j = 0; j < size; j++)
+            if (!((productIds[i][j] >= '0' && productIds[i][j] <= '9') ||
+                  (productIds[i][j] >= 'A' && productIds[i][j] <= 'Z') ||
+                  (productIds[i][j] >= 'a' && productIds[i][j] <= 'z'))) return E_INVALIDARG;
+    }
+    if (!(params = calloc( 1, sizeof(*params) ))) return E_OUTOFMEMORY;
+    if (!xgr_config_element( "StoreId", params->store_id, sizeof(params->store_id) ) || !params->store_id[0])
+    { free( params ); return HRESULT_FROM_WIN32( ERROR_NOT_FOUND ); }
+    xgr_title_identity( params->title_id, sizeof(params->title_id), params->title_client_id, sizeof(params->title_client_id) );
+    if (!(params->custom = strdup( customDeveloperString ))) goto out_of_memory;
+    if (productIdsCount)
+    {
+        if (!(params->ids = calloc( productIdsCount, sizeof(*params->ids) ))) goto out_of_memory;
+        params->count = productIdsCount;
+        for (i = 0; i < productIdsCount; i++)
+            if (!(params->ids[i] = strdup( productIds[i] ))) goto out_of_memory;
+    }
+    hr = IXThreadingImpl_XAsyncBegin( x_threading_impl, async, params, &license_token_identity,
+                                     "XStoreQueryLicenseToken", license_token_provider );
+    if (FAILED(hr)) license_token_free( params );
+    return hr;
+out_of_memory:
+    license_token_free( params );
+    return E_OUTOFMEMORY;
 }
 
 static HRESULT WINAPI x_store_XStoreQueryLicenseTokenResultSize( IXStoreImpl6 *iface, XAsyncBlock *async, SIZE_T *size )
 {
-    HRESULT hr;
-
-    TRACE( "iface %p, async %p, size %p.\n", iface, async, size );
-    if (!size) return E_INVALIDARG;
-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
-    *size = 1; /* empty token: just the NUL terminator */
-    return hr;
+    return IXThreadingImpl_XAsyncGetResultSize( x_threading_impl, async, size );
 }
 
 static HRESULT WINAPI x_store_XStoreQueryLicenseTokenResult( IXStoreImpl6 *iface, XAsyncBlock *async, SIZE_T size, char *result )
 {
-    HRESULT hr;
-
-    TRACE( "iface %p, async %p, size %Iu, result %p.\n", iface, async, size, result );
     if (!result || !size) return E_INVALIDARG;
-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
-    result[0] = 0;
-    return hr;
+    return IXThreadingImpl_XAsyncGetResult( x_threading_impl, async, &license_token_identity,
+                                          size, result, NULL );
 }
 
 static HRESULT WINAPI __PADDING__( IXStoreImpl6 *iface )

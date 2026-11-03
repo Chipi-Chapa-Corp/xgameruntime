@@ -59,9 +59,20 @@ struct xsts_token_params
     INT64 expiry;                           /* out: unix time the token expires */
 };
 
+#define XGR_LICENSE_TOKEN_MAX 60001
+struct license_token_params
+{
+    const char **ids;
+    unsigned int count;
+    const char *custom;
+    char store_id[64], title_id[64], title_client_id[64];
+    char token[XGR_LICENSE_TOKEN_MAX];
+};
+
 enum xgr_funcs
 {
     unix_xsts_token,
+    unix_license_token,
     unix_funcs_count,
 };
 

@@ -30,6 +30,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <poll.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -345,9 +347,117 @@ static NTSTATUS xsts_token( void *args )
     return status;
 }
 
+/* A dedicated request keeps account authorization and HTTP inside the service.
+ * The XML request uses base64 for custom text (XML normalizes controls). The
+ * response frame contains only the validated ASCII JWT, or is empty on error.
+ * Old services reply with an unknown-message frame; reject it, never fall back
+ * to a successful empty token. Bound the entire IPC exchange, including reads. */
+static long long license_now_ms( void )
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static BOOL license_io( int fd, void *buffer, SIZE_T size, BOOL writing, long long deadline )
+{
+    char *p = buffer;
+    struct pollfd pollfd = { fd, writing ? POLLOUT : POLLIN, 0 };
+    long long left;
+    ssize_t n;
+    int ret;
+
+    while (size)
+    {
+        left = deadline - license_now_ms();
+        if (left <= 0) { errno = ETIMEDOUT; return FALSE; }
+        ret = poll( &pollfd, 1, left );
+        if (!ret) { errno = ETIMEDOUT; return FALSE; }
+        if (ret < 0) { if (errno == EINTR) continue; return FALSE; }
+        n = writing ? send( fd, p, size, MSG_NOSIGNAL ) : recv( fd, p, size, 0 );
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        if (n <= 0) return FALSE;
+        size -= n;
+        p += n;
+    }
+    return TRUE;
+}
+
+static NTSTATUS license_token( void *args )
+{
+    struct license_token_params *params = args;
+    const char *runtime_dir = getenv( "XDG_RUNTIME_DIR" );
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    char *custom = NULL, *request = NULL, *parent = NULL, *title = NULL, *client = NULL, *id;
+    unsigned char header[8];
+    unsigned int size, i;
+    int fd = -1, n, used, error;
+    socklen_t error_size = sizeof(error);
+    struct pollfd pollfd;
+    long long deadline = license_now_ms() + 50000;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    params->token[0] = 0;
+    if (!runtime_dir || snprintf( addr.sun_path, sizeof(addr.sun_path), "%s/xodus.sock", runtime_dir ) >= (int)sizeof(addr.sun_path))
+        return STATUS_NOT_FOUND;
+    if (!(custom = base64_encode( params->custom, strlen(params->custom) )) ||
+        !(parent = xml_escape( params->store_id )) || !(title = xml_escape( params->title_id )) ||
+        !(client = xml_escape( params->title_client_id )) || !(request = malloc( 65536 )))
+    { status = STATUS_NO_MEMORY; goto done; }
+    n = snprintf( request, 65536, "<LicenseTokenRequest><ParentProductId>%s</ParentProductId>"
+                  "<CustomBase64>%s</CustomBase64><TitleId>%s</TitleId>"
+                  "<TitleClientId>%s</TitleClientId><ProductIds>", parent, custom, title, client );
+    if (n < 0 || n >= 65536) goto done;
+    used = n;
+    for (i = 0; i < params->count; i++)
+    {
+        if (!(id = xml_escape( params->ids[i] ))) { status = STATUS_NO_MEMORY; goto done; }
+        n = snprintf( request + used, 65536 - used, "<ProductId>%s</ProductId>", id );
+        free( id );
+        if (n < 0 || n >= 65536 - used) goto done;
+        used += n;
+    }
+    n = snprintf( request + used, 65536 - used, "</ProductIds></LicenseTokenRequest>" );
+    if (n < 0 || n >= 65536 - used) goto done;
+    used += n;
+    if ((fd = socket( AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0 )) < 0) goto done;
+    if (connect( fd, (struct sockaddr *)&addr, sizeof(addr) ))
+    {
+        if (errno != EINPROGRESS) goto done;
+        pollfd.fd = fd; pollfd.events = POLLOUT; pollfd.revents = 0;
+        if (poll( &pollfd, 1, 50000 ) <= 0 || getsockopt( fd, SOL_SOCKET, SO_ERROR, &error, &error_size ) || error)
+            goto done;
+    }
+    header[0] = 'X'; header[1] = 'S'; header[2] = 'D'; header[3] = 'X';
+    header[4] = 7; header[5] = 0;
+    header[6] = used & 0xff; header[7] = used >> 8;
+    if (!license_io( fd, header, sizeof(header), TRUE, deadline ) ||
+        !license_io( fd, request, used, TRUE, deadline ) ||
+        !license_io( fd, header, sizeof(header), FALSE, deadline ))
+    { if (errno == ETIMEDOUT) status = STATUS_IO_TIMEOUT; goto done; }
+    if (memcmp( header, "XSDX", 4 ) || header[4] != 8 || header[5]) goto done;
+    size = header[6] | (header[7] << 8);
+    if (!size || size >= sizeof(params->token)) goto done;
+    if (!license_io( fd, params->token, size, FALSE, deadline ))
+    { if (errno == ETIMEDOUT) status = STATUS_IO_TIMEOUT; goto done; }
+    for (i = 0; i < size; i++)
+        if (!((params->token[i] >= 'a' && params->token[i] <= 'z') ||
+              (params->token[i] >= 'A' && params->token[i] <= 'Z') ||
+              (params->token[i] >= '0' && params->token[i] <= '9') ||
+              params->token[i] == '-' || params->token[i] == '_' || params->token[i] == '.')) goto done;
+    params->token[size] = 0;
+    status = STATUS_SUCCESS;
+done:
+    if (status) params->token[0] = 0;
+    if (fd >= 0) close( fd );
+    free( request ); free( custom ); free( parent ); free( title ); free( client );
+    return status;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     xsts_token,
+    license_token,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
