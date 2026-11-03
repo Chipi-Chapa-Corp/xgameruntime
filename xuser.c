@@ -400,10 +400,10 @@ static HRESULT token_and_signature_async( XAsyncBlock *async, const char *method
     xgr_title_identity( title_id, sizeof(title_id), title_client_id, sizeof(title_client_id) );
     params.title_id = title_id;
     params.title_client_id = title_client_id;
-    if (!title_id[0] || !title_client_id[0])
-        WARN( "MicrosoftGame.config has no %s; the token will carry no title claim and "
-              "presence and multiplayer will answer 403.\n",
-              title_id[0] ? "MSAAppId" : "TitleId" );
+    if (!title_id[0])
+        WARN( "MicrosoftGame.config has no TitleId; the token request cannot identify its title.\n" );
+    else if (!title_client_id[0])
+        TRACE( "requesting Windows title authentication for %s (no MSAAppId).\n", title_id );
     if (XGR_UNIX_CALL( xsts_token, &params ))
     {
         xgr_async_complete( async, E_GAMEUSER_NO_AUTH_USER, NULL );
