@@ -50,6 +50,8 @@ struct xsts_token_params
     const char *method;                     /* in:  its HTTP method */
     const void *body;                       /* in:  its body, may be NULL */
     ULONG body_size;                        /* in */
+    const char *title_id;                   /* in:  decimal TitleId, may be NULL */
+    const char *title_client_id;            /* in:  MSAAppId, may be NULL */
     char token[XGR_TOKEN_MAX];              /* out: "XBL3.0 x=<uhs>;<token>" */
     char signature[XGR_SIGNATURE_MAX];      /* out: Signature header, may be empty */
     char xuid[XGR_IDENTITY_MAX];            /* out: decimal XUID, may be empty */

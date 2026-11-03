@@ -141,6 +141,20 @@ static BOOL config_element( const char *element, char *out, SIZE_T cap )
     return TRUE;
 }
 
+/* See private.h: the title identity Xbox mints the XSTS title claim from. */
+void xgr_title_identity( char *title_id, SIZE_T title_id_len, char *client_id, SIZE_T client_id_len )
+{
+    char hex[64];
+
+    title_id[0] = client_id[0] = 0;
+    /* The config spells TitleId in hexadecimal ("69C7AA31"); every Xbox service
+     * and the token endpoints want it decimal, so convert here rather than
+     * leaving each caller to guess which form it is holding. */
+    if (config_element( "TitleId", hex, sizeof(hex) ) && hex[0])
+        snprintf( title_id, title_id_len, "%lu", strtoul( hex, NULL, 16 ) );
+    config_element( "MSAAppId", client_id, client_id_len );
+}
+
 /* Pull attr="value" from the first <element ...> in MicrosoftGame.config. */
 static BOOL config_attr( const char *element, const char *attr, char *out, SIZE_T cap )
 {

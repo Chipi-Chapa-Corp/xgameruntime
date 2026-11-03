@@ -379,6 +379,7 @@ static HRESULT token_and_signature_async( XAsyncBlock *async, const char *method
 {
     struct xsts_token_params params = {0};
     XUserGetTokenAndSignatureData *data;
+    char title_id[64], title_client_id[64];
     SIZE_T token_len, sig_len, size;
     char *token_copy, *sig_copy;
 
@@ -391,6 +392,18 @@ static HRESULT token_and_signature_async( XAsyncBlock *async, const char *method
     params.method = method;
     params.body = body;
     params.body_size = body_size;
+
+    /* Which title is asking. Xbox puts it in the token as a claim, and the
+     * services that scope by title refuse a token claiming the wrong one --
+     * loudly enough (403) to look like a broken sign-in rather than a wrong
+     * claim, which is what makes this worth carrying on every request. */
+    xgr_title_identity( title_id, sizeof(title_id), title_client_id, sizeof(title_client_id) );
+    params.title_id = title_id;
+    params.title_client_id = title_client_id;
+    if (!title_id[0] || !title_client_id[0])
+        WARN( "MicrosoftGame.config has no %s; the token will carry no title claim and "
+              "presence and multiplayer will answer 403.\n",
+              title_id[0] ? "MSAAppId" : "TitleId" );
     if (XGR_UNIX_CALL( xsts_token, &params ))
     {
         xgr_async_complete( async, E_GAMEUSER_NO_AUTH_USER, NULL );

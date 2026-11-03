@@ -127,6 +127,17 @@ WCHAR *xgr_package_root( void );
 /* MicrosoftGame.config text (inline or from disk; UTF-8, malloc'd, or NULL). */
 char *xgr_load_game_config( void );
 
+/* The running title's identity for Xbox authentication, from its
+ * MicrosoftGame.config: `TitleId` (rendered decimal, since the config carries
+ * it in hexadecimal and Xbox wants decimal) and `MSAAppId`. Either comes back
+ * empty when the config does not carry it.
+ *
+ * Xbox mints the XSTS *title claim* from the pair, and the claim is not a
+ * formality: a service that scopes what it returns by title -- presence's
+ * titles/current, the session directory -- answers 403 to a token claiming a
+ * different title just as flatly as to one claiming none. */
+void xgr_title_identity( char *title_id, SIZE_T title_id_len, char *client_id, SIZE_T client_id_len );
+
 /* Wrap a UTF-8 filesystem path in an XPackageMountHandle (from xpackage.c). */
 void *xgr_make_mount( const char *path );
 

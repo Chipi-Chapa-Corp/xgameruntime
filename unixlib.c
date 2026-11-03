@@ -212,7 +212,7 @@ static NTSTATUS xsts_token_once( void *args )
 {
     struct xsts_token_params *params = args;
     char *request = NULL, header[8], *body = NULL, *body_b64 = NULL;
-    char *url_esc = NULL, *method_esc = NULL;
+    char *url_esc = NULL, *method_esc = NULL, *title_esc = NULL, *client_esc = NULL;
     unsigned int magic, size;
     unsigned short type, len;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -233,17 +233,27 @@ static NTSTATUS xsts_token_once( void *args )
     }
 
     if (!(url_esc = xml_escape( params->url )) ||
-        !(method_esc = xml_escape( params->method ? params->method : "GET" )))
+        !(method_esc = xml_escape( params->method ? params->method : "GET" )) ||
+        !(title_esc = xml_escape( params->title_id ? params->title_id : "" )) ||
+        !(client_esc = xml_escape( params->title_client_id ? params->title_client_id : "" )))
     { status = STATUS_NO_MEMORY; goto done; }
 
     request_size = 512 + strlen( url_esc ) + strlen( method_esc ) +
+                   strlen( title_esc ) + strlen( client_esc ) +
                    (body_b64 ? strlen( body_b64 ) : 0);
     if (!(request = malloc( request_size ))) { status = STATUS_NO_MEMORY; goto done; }
 
+    /* RelyingParty stays empty on purpose: the service resolves it from the
+     * title-management endpoint list, which is authoritative and knows hosts
+     * this side does not. TitleId and MSAAppId, on the other hand, only this
+     * side can see -- they come out of the game's own MicrosoftGame.config. */
     body_len = snprintf( request, request_size,
                          "<XSTSTokenRequest><Url>%s</Url><RelyingParty></RelyingParty>"
-                         "<Method>%s</Method><BodyBase64>%s</BodyBase64></XSTSTokenRequest>",
-                         url_esc, method_esc, body_b64 ? body_b64 : "" );
+                         "<Method>%s</Method><TitleId>%s</TitleId>"
+                         "<TitleClientId>%s</TitleClientId>"
+                         "<BodyBase64>%s</BodyBase64></XSTSTokenRequest>",
+                         url_esc, method_esc, title_esc, client_esc,
+                         body_b64 ? body_b64 : "" );
     if (body_len < 0 || body_len >= (int)request_size) goto done;
     if (body_len > 0xffff)
     {
@@ -302,6 +312,8 @@ static NTSTATUS xsts_token_once( void *args )
 done:
     free( url_esc );
     free( method_esc );
+    free( title_esc );
+    free( client_esc );
     free( request );
     free( body_b64 );
     free( body );
