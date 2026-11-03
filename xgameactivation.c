@@ -70,20 +70,23 @@ static ULONG WINAPI x_game_activation_Release( IXGameActivationImpl *iface )
 
 static HRESULT WINAPI x_game_activation_XGameActivationRegisterForEvent( IXGameActivationImpl *iface, XTaskQueueHandle queue, void *context, XGameActivationCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, queue %p, context %p, callback %p, token %p stub!\n", iface, queue, context, callback, token );
-    return E_NOTIMPL;
+    TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
+    /* nothing generates this event offline; hand back a token that never fires */
+    if (token) token->token = 1;
+    return S_OK;
 }
 
 static BOOLEAN WINAPI x_game_activation_XGameActivationUnregisterForEvent( IXGameActivationImpl *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
-    FIXME( "iface %p, token %p, wait %d stub!\n", iface, &token, wait );
-    return FALSE;
+    TRACE( "iface %p, wait %d.\n", iface, wait );
+    return TRUE;
 }
 
 static HRESULT WINAPI x_game_activation_XGameActivationAcceptPendingInvite( IXGameActivationImpl *iface, const char *inviteUri )
 {
-    FIXME( "iface %p, inviteUri %s stub!\n", iface, debugstr_a( inviteUri ) );
-    return E_NOTIMPL;
+    TRACE( "iface %p, inviteUri %s.\n", iface, debugstr_a( inviteUri ) );
+    /* there is no pending invite to accept offline */
+    return S_OK;
 }
 
 static const struct IXGameActivationImplVtbl x_game_activation_vtbl =

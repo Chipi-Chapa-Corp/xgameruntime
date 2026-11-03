@@ -72,8 +72,13 @@ static ULONG WINAPI x_game_Release( IXGameImpl3 *iface )
 
 static HRESULT WINAPI x_game_XGameGetXboxTitleId( IXGameImpl3 *iface, UINT32 *titleId )
 {
-    FIXME( "iface %p, titleId %p stub!\n", iface, titleId );
-    return E_NOTIMPL;
+    TRACE( "iface %p, titleId %p.\n", iface, titleId );
+
+    /* Without a registered package there is no title identity to report. Hand
+     * back zero rather than failing: callers treat an error here as fatal. */
+    if (!titleId) return E_INVALIDARG;
+    *titleId = 0;
+    return S_OK;
 }
 
 static void WINAPI x_game_XLaunchNewGame( IXGameImpl3 *iface, const char *exePath, const char *args, XUserHandle defaultUser )

@@ -71,14 +71,16 @@ static ULONG WINAPI x_accessibility_Release( IXAccessibilityImpl2 *iface )
 
 static HRESULT WINAPI x_accessibility_XClosedCaptionGetProperties( IXAccessibilityImpl2 *iface, XClosedCaptionProperties *properties )
 {
-    FIXME( "iface %p, properties %p stub!\n", iface, properties );
-    return E_NOTIMPL;
+    TRACE( "iface %p, properties %p.\n", iface, properties );
+    if (!properties) return E_INVALIDARG;
+    memset( properties, 0, sizeof(*properties) ); /* closed captions disabled */
+    return S_OK;
 }
 
 static HRESULT WINAPI x_accessibility_XClosedCaptionSetEnabled( IXAccessibilityImpl2 *iface, BOOLEAN enabled )
 {
-    FIXME( "iface %p, enabled %d stub!\n", iface, enabled );
-    return E_NOTIMPL;
+    TRACE( "iface %p, enabled %d.\n", iface, enabled );
+    return S_OK;
 }
 
 static HRESULT WINAPI x_accessibility_XHighContrastGetMode( IXAccessibilityImpl2 *iface, XHighContrastMode *mode )

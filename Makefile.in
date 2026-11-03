@@ -1,8 +1,10 @@
 MODULE    = xgameruntime.dll
-IMPORTS   = combase
+UNIXLIB   = xgameruntime.so
+IMPORTS   = combase bcrypt
 
 SOURCES = \
 	main.c \
+	unixlib.c \
 	xaccessibility.c \
 	xaccessibility.idl \
 	xappcapture.c \

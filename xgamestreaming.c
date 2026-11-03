@@ -89,14 +89,15 @@ static BOOLEAN WINAPI x_game_streaming_XGameStreamingIsStreaming( IXGameStreamin
 
 static HRESULT WINAPI x_game_streaming_XGameStreamingRegisterClientPropertiesChanged( IXGameStreamingImpl3 *iface, XGameStreamingClientId client, XTaskQueueHandle queue, void *context, XGameStreamingClientPropertiesChangedCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, client %llu, queue %p, context %p, callback %p, token %p stub!\n", iface, client, queue, context, callback, token );
-    return E_NOTIMPL;
+    TRACE( "iface %p, token %p.\n", iface, token );
+    if (token) token->token = 1;  /* offline this state never changes */
+    return S_OK;
 }
 
 static BOOLEAN WINAPI x_game_streaming_XGameStreamingUnregisterClientPropertiesChanged( IXGameStreamingImpl3 *iface, XGameStreamingClientId client, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
-    FIXME( "iface %p, client %llu, token %p, wait %d stub!\n", iface, client, &token, wait );
-    return FALSE;
+    TRACE( "iface %p, wait %d.\n", iface, wait );
+    return TRUE;
 }
 
 static HRESULT WINAPI x_game_streaming_XGameStreamingGetStreamPhysicalDimensions( IXGameStreamingImpl3 *iface, XGameStreamingClientId client, UINT32 *horizontalMm, UINT32 *verticalMm )
@@ -125,14 +126,15 @@ static XGameStreamingConnectionState WINAPI x_game_streaming_XGameStreamingGetCo
 
 static HRESULT WINAPI x_game_streaming_XGameStreamingRegisterConnectionStateChanged( IXGameStreamingImpl3 *iface, XTaskQueueHandle queue, void *context, XGameStreamingConnectionStateChangedCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, queue %p, context %p, callback %p, token %p stub!\n", iface, queue, context, callback, token );
-    return E_NOTIMPL;
+    TRACE( "iface %p, token %p.\n", iface, token );
+    if (token) token->token = 1;  /* offline this state never changes */
+    return S_OK;
 }
 
 static BOOLEAN WINAPI x_game_streaming_XGameStreamingUnregisterConnectionStateChanged( IXGameStreamingImpl3 *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
-    FIXME( "iface %p, token %p, wait %d stub!\n", iface, &token, wait );
-    return FALSE;
+    TRACE( "iface %p, wait %d.\n", iface, wait );
+    return TRUE;
 }
 
 static HRESULT WINAPI x_game_streaming_XGameStreamingGetStreamAddedLatency( IXGameStreamingImpl3 *iface, XGameStreamingClientId client, UINT32 *averageInputLatencyUs, UINT32 *averageOutputLatencyUs, UINT32 *standardDeviationUs )
@@ -175,8 +177,10 @@ static void WINAPI x_game_streaming_XGameStreamingShowTouchControlLayoutOnClient
 
 static HRESULT WINAPI x_game_streaming_XGameStreamingIsTouchInputEnabled( IXGameStreamingImpl3 *iface, XGameStreamingClientId client, BOOLEAN *touchInputEnabled )
 {
-    FIXME( "iface %p, client %llu, touchInputEnabled %p stub!\n", iface, client, touchInputEnabled );
-    return E_NOTIMPL;
+    TRACE( "iface %p, client %I64u, touchInputEnabled %p.\n", iface, client, touchInputEnabled );
+    if (!touchInputEnabled) return E_INVALIDARG;
+    *touchInputEnabled = FALSE; /* not being streamed, no touch client */
+    return S_OK;
 }
 
 static HRESULT WINAPI x_game_streaming_XGameStreamingGetLastFrameDisplayed( IXGameStreamingImpl3 *iface, XGameStreamingClientId client, D3D12XBOX_FRAME_PIPELINE_TOKEN *framePipelineToken )

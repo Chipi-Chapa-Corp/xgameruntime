@@ -23,6 +23,17 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
+/* Return a fixed string through the (size, buffer, used) convention. */
+static HRESULT system_return_string( const char *str, INT32 size, char *buffer, SIZE_T *used )
+{
+    SIZE_T len = strlen( str ) + 1;
+    if (!buffer) return E_INVALIDARG;
+    if ((SIZE_T)size < len) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+    memcpy( buffer, str, len );
+    if (used) *used = len;
+    return S_OK;
+}
+
 const SIZE_T XSystemAppSpecificDeviceIdBytes = 45;
 const SIZE_T XSystemConsoleIdBytes = 39;
 const SIZE_T XSystemXboxLiveSandboxIdMaxBytes = 16;
@@ -78,62 +89,37 @@ static ULONG WINAPI x_system_Release( IXSystemImpl5 *iface )
 
 static HRESULT WINAPI x_system_XSystemGetConsoleId( IXSystemImpl5 *iface, INT32 consoleIdSize, char *consoleId, SIZE_T *consoleIdUsed )
 {
-    /* For Windows, Console ID is always `00000000.00000000.00000000.00000000.00 */
-    const char *Id = "00000000.00000000.00000000.00000000.00";
-
-    TRACE( "iface %p, consoleIdSize %d, consoleId %p, consoleIdUsed %p\n", iface, consoleIdSize, consoleId, consoleIdUsed );
-
-    if (!consoleId || !consoleIdUsed)
-        return E_POINTER;
-
-    if (consoleIdSize < XSystemConsoleIdBytes)
-        return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
-
-    strcpy_s( consoleId, consoleIdSize, Id );
-    *consoleIdUsed = strlen( Id ) + 1;
-    return S_OK;
+    TRACE( "iface %p, consoleIdSize %d, consoleId %p.\n", iface, consoleIdSize, consoleId );
+    return system_return_string( "0000000000000000000000000000000000", consoleIdSize, consoleId, consoleIdUsed );
 }
 
 static HRESULT WINAPI x_system_XSystemGetXboxLiveSandboxId( IXSystemImpl5 *iface, INT32 sandboxIdSize, char *sandboxId, SIZE_T *sandboxIdUsed )
 {
-    /* Always assume RETAIL environment for Wine */
-    const char *Id = "RETAIL";
-
-    TRACE( "iface %p, sandboxIdSize %d, sandboxId %p, sandboxIdUsed %p\n", iface, sandboxIdSize, sandboxId, sandboxIdUsed );
-
-    if (!sandboxId || !sandboxIdUsed)
-        return E_POINTER;
-
-    if (sandboxIdSize < XSystemXboxLiveSandboxIdMaxBytes)
-        return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
-
-    strcpy_s( sandboxId, sandboxIdSize, Id );
-    *sandboxIdUsed = strlen( Id ) + 1;
-    return S_OK;
+    TRACE( "iface %p, sandboxIdSize %d, sandboxId %p.\n", iface, sandboxIdSize, sandboxId );
+    return system_return_string( "RETAIL", sandboxIdSize, sandboxId, sandboxIdUsed );
 }
 
 static HRESULT WINAPI x_system_XSystemGetAppSpecificDeviceId( IXSystemImpl5 *iface, INT32 appSpecificDeviceIdSize, char *appSpecificDeviceId, SIZE_T *appSpecificDeviceIdUsed )
 {
-    FIXME( "iface %p, appSpecificDeviceIdSize %d, appSpecificDeviceId %p, appSpecificDeviceIdUsed %p stub!\n", iface, appSpecificDeviceIdSize, appSpecificDeviceId, appSpecificDeviceIdUsed );
-    return E_NOTIMPL;
+    TRACE( "iface %p, appSpecificDeviceIdSize %d, appSpecificDeviceId %p.\n", iface, appSpecificDeviceIdSize, appSpecificDeviceId );
+    return system_return_string( "00000000-0000-0000-0000-000000000000", appSpecificDeviceIdSize, appSpecificDeviceId, appSpecificDeviceIdUsed );
 }
 
 static HRESULT WINAPI x_system_XSystemHandleTrack( IXSystemImpl5 *iface, XSystemHandleCallback callback, void *context )
 {
-    FIXME( "iface %p, callback %p, context %p stub!\n", iface, callback, context );
-    return E_NOTIMPL;
+    TRACE( "iface %p, callback %p, context %p.\n", iface, callback, context );
+    return S_OK;
 }
 
 static BOOLEAN WINAPI x_system_XSystemIsHandleValid( IXSystemImpl5 *iface, XSystemHandle handle )
 {
-    /* always assume it's valid. */
-    FIXME( "iface %p, handle %p stub!\n", iface, handle );
-    return TRUE;
+    TRACE( "iface %p, handle %p.\n", iface, handle );
+    return handle != NULL;
 }
 
 static void WINAPI x_system_XSystemAllowFullDownloadBandwidth( IXSystemImpl5 *iface, BOOLEAN enable )
 {
-    FIXME( "iface %p, enable %d stub!\n", iface, enable );
+    TRACE( "iface %p, enable %d.\n", iface, enable );
 }
 
 static const struct IXSystemImpl5Vtbl x_system_vtbl =

@@ -110,8 +110,8 @@ static HRESULT WINAPI capture_XAppCaptureCloseScreenshotStream( IXAppCaptureImpl
 
 static HRESULT WINAPI capture_XAppCaptureEnableRecord( IXAppCaptureImpl4 *iface )
 {
-    FIXME( "iface %p stub!\n", iface );
-    return E_NOTIMPL;
+    TRACE( "iface %p.\n", iface );
+    return S_OK;
 }
 
 static HRESULT WINAPI capture_XAppCaptureDisableRecord( IXAppCaptureImpl4 *iface )
@@ -237,19 +237,22 @@ static HRESULT WINAPI metadata_XAppBroadcastShowUI( IXAppCaptureMetadataImpl *if
 
 static HRESULT WINAPI metadata_XAppBroadcastGetStatus( IXAppCaptureMetadataImpl *iface, XUserHandle requestingUser, XAppBroadcastStatus *appBroadcastStatus )
 {
-    FIXME( "iface %p, requestingUser %p, appBroadcastStatus %p stub!\n", iface, requestingUser, appBroadcastStatus );
-    return E_NOTIMPL;
+    TRACE( "iface %p, requestingUser %p, appBroadcastStatus %p.\n", iface, requestingUser, appBroadcastStatus );
+    if (!appBroadcastStatus) return E_INVALIDARG;
+    memset( appBroadcastStatus, 0, sizeof(*appBroadcastStatus) ); /* not broadcasting, not possible offline */
+    return S_OK;
 }
 
 static HRESULT WINAPI metadata_XAppBroadcastRegisterIsAppBroadcastingChanged( IXAppCaptureMetadataImpl *iface, XTaskQueueHandle queue, void *context, XAppBroadcastMonitorCallback *appBroadcastMonitorCallback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, queue %p, context %p, appBroadcastMonitorCallback %p, token %p stub!\n", iface, queue, context, appBroadcastMonitorCallback, token );
-    return E_NOTIMPL;
+    TRACE( "iface %p, token %p.\n", iface, token );
+    if (token) token->token = 1;  /* offline this state never changes */
+    return S_OK;
 }
 
 static BOOLEAN WINAPI metadata_XAppBroadcastUnregisterIsAppBroadcastingChanged( IXAppCaptureMetadataImpl *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
-    FIXME( "iface %p, token %p, wait %d stub!\n", iface, &token, wait );
+    TRACE( "iface %p, wait %d.\n", iface, wait );
     return TRUE;
 }
 
@@ -303,19 +306,22 @@ static HRESULT WINAPI metadata_XAppCaptureMetadataStopAllStates( IXAppCaptureMet
 
 static HRESULT WINAPI metadata_XAppCaptureMetadataRemainingStorageBytesAvailable( IXAppCaptureMetadataImpl *iface, UINT64 *value )
 {
-    FIXME( "iface %p, value %p stub!\n", iface, value );
-    return E_NOTIMPL;
+    TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_INVALIDARG;
+    *value = 0;
+    return S_OK;
 }
 
 static HRESULT WINAPI metadata_XAppCaptureRegisterMetadataPurged( IXAppCaptureMetadataImpl *iface, XTaskQueueHandle queue, void *context, XAppCaptureMetadataPurgedCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, queue %p, context %p, callback %p, token %p stub!\n", iface, queue, context, callback, token );
-    return E_NOTIMPL;
+    TRACE( "iface %p, token %p.\n", iface, token );
+    if (token) token->token = 1;  /* offline this state never changes */
+    return S_OK;
 }
 
 static BOOLEAN WINAPI metadata_XAppCaptureUnRegisterMetadataPurged( IXAppCaptureMetadataImpl *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
-    FIXME( "iface %p, token %p, wait %d stub!\n", iface, &token, wait );
+    TRACE( "iface %p, wait %d.\n", iface, wait );
     return TRUE;
 }
 

@@ -90,3 +90,50 @@ extern IXUserImpl *x_user_impl;
 extern IXUserDeviceImpl *x_user_device_impl;
 
 HRESULT WINAPI QueryApiImpl( const GUID *classId, REFIID interfaceId, void **out );
+
+/* Minimal XAsync completion state.
+ *
+ * The GDK async pattern is: the caller fills an XAsyncBlock, an *Async() entry
+ * point starts the work, and once it finishes the block's callback runs and the
+ * caller retrieves the outcome with a matching *Result() call (or polls with
+ * XAsyncGetStatus). Operations that can be satisfied locally have no work to
+ * schedule, so they complete inline: record the result in the block's opaque
+ * internal[] slots and invoke the callback before returning.
+ */
+#define XGR_ASYNC_MAGIC ((void *)(ULONG_PTR)0x53554458) /* 'XDUS' */
+
+/* Record the outcome and queue the completion callback.
+ *
+ * The callback must not run here: callers expect it while they are pumping
+ * their task queue (XTaskQueueDispatch), not re-entrantly from inside the
+ * *Async() call they are still making. Delivering it inline leaves titles
+ * spinning in their dispatch loop waiting for a completion that already fired.
+ */
+void xgr_async_complete( XAsyncBlock *async, HRESULT hr, void *payload );
+/* Same, also recording the buffer size XAsyncGetResultSize should report. */
+void xgr_async_complete_ex( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size );
+
+/* Inline MicrosoftGame.config text from InitializeApiImplEx2, or NULL. */
+extern char *xgr_game_config;
+
+/* XUID of the single local user (0 when unknown, see XGR_XUID). */
+UINT64 xgr_local_xuid( void );
+
+/* Derived package family name (UTF-8, malloc'd) and install-root directory
+ * (WCHAR, malloc'd), shared between XGameSave and XPackage. */
+char *xgr_package_family( void );
+WCHAR *xgr_package_root( void );
+
+/* MicrosoftGame.config text (inline or from disk; UTF-8, malloc'd, or NULL). */
+char *xgr_load_game_config( void );
+
+/* Wrap a UTF-8 filesystem path in an XPackageMountHandle (from xpackage.c). */
+void *xgr_make_mount( const char *path );
+
+static inline BOOL xgr_async_completed( const XAsyncBlock *async, HRESULT *hr, void **payload )
+{
+    if (!async || async->internal[0] != XGR_ASYNC_MAGIC) return FALSE;
+    if (hr) *hr = (HRESULT)(ULONG_PTR)async->internal[1];
+    if (payload) *payload = async->internal[2];
+    return TRUE;
+}

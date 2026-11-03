@@ -71,32 +71,37 @@ static ULONG WINAPI x_game_invite_Release( IXGameInviteImpl2 *iface )
 
 static HRESULT WINAPI x_game_invite_XGameInviteRegisterForEvent( IXGameInviteImpl2 *iface, XTaskQueueHandle queue, void *context, XGameInviteEventCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, queue %p, context %p, callback %p, token %p stub!\n", iface, queue, context, callback, token );
-    return E_NOTIMPL;
+    TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
+    /* nothing generates this event offline; hand back a token that never fires */
+    if (token) token->token = 1;
+    return S_OK;
 }
 
 static BOOLEAN WINAPI x_game_invite_XGameInviteUnregisterForEvent( IXGameInviteImpl2 *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
-    FIXME( "iface %p, token %p, wait %d stub!\n", iface, &token, wait );
+    TRACE( "iface %p, wait %d.\n", iface, wait );
     return TRUE;
 }
 
 static HRESULT WINAPI x_game_invite_XGameInviteRegisterForPendingEvent( IXGameInviteImpl2 *iface, XTaskQueueHandle queue, void *context, XGameInviteEventCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, queue %p, context %p, callback %p, token %p stub!\n", iface, queue, context, callback, token );
-    return E_NOTIMPL;
+    TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
+    /* nothing generates this event offline; hand back a token that never fires */
+    if (token) token->token = 1;
+    return S_OK;
 }
 
 static BOOLEAN WINAPI x_game_invite_XGameInviteUnregisterForPendingEvent( IXGameInviteImpl2 *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
-    FIXME( "iface %p, token %p, wait %d stub!\n", iface, &token, wait );
-    return FALSE;
+    TRACE( "iface %p, wait %d.\n", iface, wait );
+    return TRUE;
 }
 
 static HRESULT WINAPI x_game_invite_XGameInviteAcceptPendingInvite( IXGameInviteImpl2 *iface, const char *inviteUri )
 {
-    FIXME( "iface %p, inviteUri %s stub!\n", iface, debugstr_a( inviteUri ) );
-    return E_NOTIMPL;
+    TRACE( "iface %p, inviteUri %s.\n", iface, debugstr_a( inviteUri ) );
+    /* there is no pending invite to accept offline */
+    return S_OK;
 }
 
 static const struct IXGameInviteImpl2Vtbl x_game_invite_vtbl =

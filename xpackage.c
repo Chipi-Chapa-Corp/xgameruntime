@@ -19,9 +19,39 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+/*
+ * The package model, as seen by a single locally-installed title running
+ * offline. There is exactly one package -- the game itself -- and it is fully
+ * installed, so the questions this API answers have simple, honest answers:
+ * the current package identifier is the game's, the mount path is its install
+ * directory, enumeration returns that one package, and every chunk is Ready.
+ * The download/uninstall entry points that only make sense against a live
+ * Store succeed as no-ops rather than failing, because titles call them
+ * defensively at startup and an E_NOTIMPL there stops them dead. This is what
+ * UE5 GDK titles need in particular: they call XPackageGetMountPath during
+ * initialisation and abort if it fails.
+ */
+
 #include "private.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
+
+/* A mount handle just carries the filesystem path it resolves to. */
+struct x_package_mount
+{
+    char *path;
+};
+
+/* An installation monitor over an already-installed package: nothing to track,
+ * but it must be a distinct non-NULL handle the title can query and close. */
+struct x_package_monitor
+{
+    LONG dummy;
+};
 
 struct x_package
 {
@@ -33,6 +63,133 @@ static inline struct x_package *impl_from_IXPackageImpl3( IXPackageImpl3 *iface 
 {
     return CONTAINING_RECORD( iface, struct x_package, IXPackageImpl3_iface );
 }
+
+/* ---- helpers ------------------------------------------------------------ */
+
+static char *wide_to_utf8( const WCHAR *str )
+{
+    char *ret;
+    int len;
+
+    if (!str) return NULL;
+    if (!(len = WideCharToMultiByte( CP_UTF8, 0, str, -1, NULL, 0, NULL, NULL ))) return NULL;
+    if (!(ret = malloc( len ))) return NULL;
+    WideCharToMultiByte( CP_UTF8, 0, str, -1, ret, len, NULL, NULL );
+    return ret;
+}
+
+/* Wrap a filesystem path in a mount handle. Shared with XPersistentLocalStorage
+ * so both hand back handles XPackageGetMountPath can read. */
+void *xgr_make_mount( const char *path )
+{
+    struct x_package_mount *m;
+    SIZE_T len;
+
+    if (!path || !(m = calloc( 1, sizeof(*m) ))) return NULL;
+    len = strlen( path ) + 1;
+    if (!(m->path = malloc( len )))
+    {
+        free( m );
+        return NULL;
+    }
+    memcpy( m->path, path, len );
+    return m;
+}
+
+/* The current package's mount path: its install directory, as a DOS path. */
+static char *current_mount_path( void )
+{
+    WCHAR *root = xgr_package_root();
+    char *path;
+
+    if (!root) return NULL;
+    path = wide_to_utf8( root );
+    free( root );
+    return path;
+}
+
+/* MicrosoftGame.config text, loaded once (inline or from disk). */
+static const char *game_config( void )
+{
+    static char *cached;
+    static BOOL loaded;
+
+    if (!loaded)
+    {
+        cached = xgr_load_game_config();
+        loaded = TRUE;
+    }
+    return cached;
+}
+
+/* Pull the text of <element>text</element> from MicrosoftGame.config. */
+static BOOL config_element( const char *element, char *out, SIZE_T cap )
+{
+    const char *xml = game_config(), *value;
+    char tag[64];
+    SIZE_T len;
+
+    out[0] = 0;
+    if (!xml) return FALSE;
+    snprintf( tag, sizeof(tag), "<%s>", element );
+    if (!(value = strstr( xml, tag ))) return FALSE;
+    value += strlen( tag );
+    len = strcspn( value, "<" );
+    if (len >= cap) return FALSE;
+    memcpy( out, value, len );
+    out[len] = 0;
+    return TRUE;
+}
+
+/* Pull attr="value" from the first <element ...> in MicrosoftGame.config. */
+static BOOL config_attr( const char *element, const char *attr, char *out, SIZE_T cap )
+{
+    const char *xml = game_config(), *start, *end, *value;
+    SIZE_T len;
+
+    out[0] = 0;
+    if (!xml || !(start = strstr( xml, element )) || !(end = strchr( start, '>' ))) return FALSE;
+    if (!(value = strstr( start, attr )) || value > end) return FALSE;
+    value += strlen( attr );
+    len = strcspn( value, "\"" );
+    if (len >= cap) return FALSE;
+    memcpy( out, value, len );
+    out[len] = 0;
+    return TRUE;
+}
+
+/* Fill an XPackageDetails describing the current game package. The strings it
+ * points at are owned by the caller-provided storage, valid for the callback. */
+static void fill_current_details( XPackageDetails *details, char *identifier, char *display,
+                                  char *title_id )
+{
+    char version[64] = {0};
+
+    memset( details, 0, sizeof(*details) );
+    details->packageIdentifier = identifier;
+    details->kind = XPackageKind_Game;
+    details->displayName = display;
+    details->description = display;
+    details->publisher = "";
+    details->storeId = "";
+    details->titleID = title_id;
+    details->installing = FALSE;
+    details->ageRestricted = FALSE;
+    details->index = 0;
+    details->count = 1;
+
+    if (config_attr( "<Identity", " Version=\"", version, sizeof(version) ))
+    {
+        unsigned int a = 0, b = 0, c = 0, d = 0;
+        sscanf( version, "%u.%u.%u.%u", &a, &b, &c, &d );
+        details->version.major = a;
+        details->version.minor = b;
+        details->version.build = c;
+        details->version.revision = d;
+    }
+}
+
+/* ---- QueryInterface / lifetime ------------------------------------------ */
 
 static HRESULT WINAPI x_package_QueryInterface( IXPackageImpl3 *iface, REFIID iid, void **out )
 {
@@ -70,229 +227,381 @@ static ULONG WINAPI x_package_Release( IXPackageImpl3 *iface )
     return ref;
 }
 
+/* ---- identity ----------------------------------------------------------- */
+
 static HRESULT WINAPI x_package_XPackageGetCurrentProcessPackageIdentifier( IXPackageImpl3 *iface, SIZE_T bufferSize, char *buffer )
 {
-    FIXME( "iface %p, bufferSize %Iu, buffer %p stub!\n", iface, bufferSize, buffer );
-    return E_NOTIMPL;
+    char *id;
+    SIZE_T len;
+
+    TRACE( "iface %p, bufferSize %Iu, buffer %p.\n", iface, bufferSize, buffer );
+
+    if (!buffer) return E_INVALIDARG;
+    if (!(id = xgr_package_family())) return HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE );
+    len = strlen( id ) + 1;
+    if (bufferSize < len)
+    {
+        free( id );
+        return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+    }
+    memcpy( buffer, id, len );
+    free( id );
+    return S_OK;
 }
 
 static BOOLEAN WINAPI x_package_XPackageIsPackagedProcess( IXPackageImpl3 *iface )
 {
-    FIXME( "iface %p stub!\n", iface );
-    return FALSE;
-}
-
-static HRESULT WINAPI x_package_XPackageCreateInstallationMonitor( IXPackageImpl3 *iface, const char *packageIdentifier, UINT32 selectorCount, XPackageChunkSelector *selectors, UINT32 minimumUpdateIntervalMs, XTaskQueueHandle queue, XPackageInstallationMonitorHandle *installationMonitor )
-{
-    FIXME( "iface %p, packageIdentifier %s, selectorCount %u, selectors %p, minimumUpdateIntervalMs %u, queue %p, installationMonitor %p stub!\n", iface, debugstr_a( packageIdentifier ), selectorCount, selectors, minimumUpdateIntervalMs, queue, installationMonitor );
-    return E_NOTIMPL;
-}
-
-static void WINAPI x_package_XPackageCloseInstallationMonitorHandle( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor )
-{
-    FIXME( "iface %p, installationMonitor %p stub!\n", iface, installationMonitor );
-}
-
-static void WINAPI x_package_XPackageGetInstallationProgress( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor, XPackageInstallationProgress *progress )
-{
-    FIXME( "iface %p, installationMonitor %p, progress %p stub!\n", iface, installationMonitor, progress );
-}
-
-static BOOLEAN WINAPI x_package_XPackageUpdateInstallationMonitor( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor )
-{
-    FIXME( "iface %p, installationMonitor %p stub!\n", iface, installationMonitor );
-    return TRUE;
-}
-
-static HRESULT WINAPI x_package_XPackageRegisterInstallationProgressChanged( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor, void *context, XPackageInstallationProgressCallback *callback, XTaskQueueRegistrationToken *token )
-{
-    FIXME( "iface %p, installationMonitor %p, context %p, callback %p, token %p stub!\n", iface, installationMonitor, context, callback, token );
-    return E_NOTIMPL;
-}
-
-static BOOLEAN WINAPI x_package_XPackageUnregisterInstallationProgressChanged( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor, XTaskQueueRegistrationToken token, BOOLEAN wait )
-{
-    FIXME( "iface %p, installationMonitor %p, token %p, wait %d stub!\n", iface, installationMonitor, &token, wait );
+    TRACE( "iface %p.\n", iface );
     return TRUE;
 }
 
 static HRESULT WINAPI x_package_XPackageGetUserLocale( IXPackageImpl3 *iface, SIZE_T localeSize, char *locale )
 {
-    FIXME( "iface %p, localeSize %Iu, locale %p stub!\n", iface, localeSize, locale );
-    return E_NOTIMPL;
+    WCHAR buf[LOCALE_NAME_MAX_LENGTH];
+    char out[LOCALE_NAME_MAX_LENGTH * 3];
+    SIZE_T len;
+
+    TRACE( "iface %p, localeSize %Iu, locale %p.\n", iface, localeSize, locale );
+
+    if (!locale) return E_INVALIDARG;
+    if (!GetUserDefaultLocaleName( buf, ARRAY_SIZE(buf) )) wcscpy( buf, L"en-US" );
+    WideCharToMultiByte( CP_UTF8, 0, buf, -1, out, sizeof(out), NULL, NULL );
+    len = strlen( out ) + 1;
+    if (localeSize < len) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+    memcpy( locale, out, len );
+    return S_OK;
 }
+
+/* ---- installation state (everything is already installed) --------------- */
+
+static HRESULT WINAPI x_package_XPackageCreateInstallationMonitor( IXPackageImpl3 *iface, const char *packageIdentifier, UINT32 selectorCount, XPackageChunkSelector *selectors, UINT32 minimumUpdateIntervalMs, XTaskQueueHandle queue, XPackageInstallationMonitorHandle *installationMonitor )
+{
+    struct x_package_monitor *monitor;
+
+    TRACE( "iface %p, packageIdentifier %s, selectorCount %u, minimumUpdateIntervalMs %u, installationMonitor %p.\n",
+           iface, debugstr_a( packageIdentifier ), selectorCount, minimumUpdateIntervalMs, installationMonitor );
+
+    if (!installationMonitor) return E_INVALIDARG;
+    if (!(monitor = calloc( 1, sizeof(*monitor) ))) return E_OUTOFMEMORY;
+    *installationMonitor = (XPackageInstallationMonitorHandle)monitor;
+    return S_OK;
+}
+
+static void WINAPI x_package_XPackageCloseInstallationMonitorHandle( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor )
+{
+    TRACE( "iface %p, installationMonitor %p.\n", iface, installationMonitor );
+    free( installationMonitor );
+}
+
+static void WINAPI x_package_XPackageGetInstallationProgress( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor, XPackageInstallationProgress *progress )
+{
+    TRACE( "iface %p, installationMonitor %p, progress %p.\n", iface, installationMonitor, progress );
+
+    if (!progress) return;
+    /* fully installed: a non-zero, all-installed, launchable, completed state */
+    progress->totalBytes = 1;
+    progress->installedBytes = 1;
+    progress->launchBytes = 0;
+    progress->launchable = TRUE;
+    progress->completed = TRUE;
+}
+
+static BOOLEAN WINAPI x_package_XPackageUpdateInstallationMonitor( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor )
+{
+    TRACE( "iface %p, installationMonitor %p.\n", iface, installationMonitor );
+    /* nothing changes: install is already complete */
+    return FALSE;
+}
+
+static HRESULT WINAPI x_package_XPackageRegisterInstallationProgressChanged( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor, void *context, XPackageInstallationProgressCallback *callback, XTaskQueueRegistrationToken *token )
+{
+    TRACE( "iface %p, installationMonitor %p, context %p, callback %p, token %p.\n", iface, installationMonitor, context, callback, token );
+
+    /* nothing will ever change, so no callback is scheduled; hand back a token */
+    if (token) token->token = 1;
+    return S_OK;
+}
+
+static BOOLEAN WINAPI x_package_XPackageUnregisterInstallationProgressChanged( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor, XTaskQueueRegistrationToken token, BOOLEAN wait )
+{
+    TRACE( "iface %p, installationMonitor %p, wait %d.\n", iface, installationMonitor, wait );
+    return TRUE;
+}
+
+/* ---- chunks (all present) ----------------------------------------------- */
 
 static HRESULT WINAPI x_package_XPackageFindChunkAvailability( IXPackageImpl3 *iface, const char *packageIdentifier, UINT32 selectorCount, XPackageChunkSelector *selectors, XPackageChunkAvailability *availability )
 {
-    FIXME( "iface %p, packageIdentifier %s, selectorCount %u, selectors %p, availability %p stub!\n", iface, packageIdentifier, selectorCount, selectors, availability );
-    return E_NOTIMPL;
+    TRACE( "iface %p, packageIdentifier %s, selectorCount %u, availability %p.\n", iface, debugstr_a( packageIdentifier ), selectorCount, availability );
+
+    if (!availability) return E_INVALIDARG;
+    *availability = XPackageChunkAvailability_Ready;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageEnumerateChunkAvailability( IXPackageImpl3 *iface, const char *packageIdentifier, XPackageChunkSelectorType type, void *context, XPackageChunkAvailabilityCallback *callback )
 {
-    FIXME( "iface %p, packageIdentifier %s, type %d, context %p, callback %p stub!\n", iface, debugstr_a( packageIdentifier ), type, context, callback );
-    return E_NOTIMPL;
+    TRACE( "iface %p, packageIdentifier %s, type %d, context %p, callback %p.\n", iface, debugstr_a( packageIdentifier ), type, context, callback );
+    /* no pending chunks to report; everything is already Ready */
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageChangeChunkInstallOrder( IXPackageImpl3 *iface, const char *packageIdentifier, UINT32 selectorCount, XPackageChunkSelector *selectors )
 {
-    FIXME( "iface %p, packageIdentifier %s, selectorCount %u, selectors %p stub!\n", iface, debugstr_a( packageIdentifier ), selectorCount, selectors );
-    return E_NOTIMPL;
+    TRACE( "iface %p, packageIdentifier %s, selectorCount %u.\n", iface, debugstr_a( packageIdentifier ), selectorCount );
+    /* order is moot when nothing is queued for download */
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageInstallChunks( IXPackageImpl3 *iface, const char *packageIdentifier, UINT32 selectorCount, XPackageChunkSelector *selectors, UINT32 minimumUpdateIntervalMs, BOOLEAN suppressUserConfirmation, XTaskQueueHandle queue, XPackageInstallationMonitorHandle *installationMonitor )
 {
-    FIXME( "iface %p, packageIdentifier %s, selectorCount %u, selectors %p, minimumUpdateIntervalMs %u, suppressUserConfirmation %d, queue %p, installationMonitor %p stub!\n", iface, debugstr_a( packageIdentifier ), selectorCount, selectors, minimumUpdateIntervalMs, suppressUserConfirmation, queue, installationMonitor );
-    return E_NOTIMPL;
+    TRACE( "iface %p, packageIdentifier %s, selectorCount %u, installationMonitor %p.\n", iface, debugstr_a( packageIdentifier ), selectorCount, installationMonitor );
+    /* nothing to install; hand back a completed monitor */
+    return x_package_XPackageCreateInstallationMonitor( iface, packageIdentifier, selectorCount, selectors, minimumUpdateIntervalMs, queue, installationMonitor );
 }
 
 static HRESULT WINAPI x_package_XPackageInstallChunksAsync( IXPackageImpl3 *iface, const char *packageIdentifier, UINT32 selectorCount, XPackageChunkSelector *selectors, UINT32 minimumUpdateIntervalMs, BOOLEAN suppressUserConfirmation, XAsyncBlock *asyncBlock )
 {
-    FIXME( "iface %p, packageIdentifier %s, selectorCount %u, selectors %p, minimumUpdateIntervalMs %u, suppressUserConfirmation %d, asyncBlock %p stub!\n", iface, packageIdentifier, selectorCount, selectors, minimumUpdateIntervalMs, suppressUserConfirmation, asyncBlock );
-    return E_NOTIMPL;
+    struct x_package_monitor *monitor;
+
+    TRACE( "iface %p, packageIdentifier %s, selectorCount %u, asyncBlock %p.\n", iface, debugstr_a( packageIdentifier ), selectorCount, asyncBlock );
+
+    if (!asyncBlock) return E_INVALIDARG;
+    monitor = calloc( 1, sizeof(*monitor) );
+    xgr_async_complete( asyncBlock, monitor ? S_OK : E_OUTOFMEMORY, monitor );
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageInstallChunksResult( IXPackageImpl3 *iface, XAsyncBlock *asyncBlock, XPackageInstallationMonitorHandle *installationMonitor )
 {
-    FIXME( "iface %p, asyncBlock %p, installationMonitor %p stub!\n", iface, asyncBlock, installationMonitor );
-    return E_NOTIMPL;
+    void *payload;
+    HRESULT hr;
+
+    TRACE( "iface %p, asyncBlock %p, installationMonitor %p.\n", iface, asyncBlock, installationMonitor );
+
+    if (!installationMonitor) return E_INVALIDARG;
+    if (!xgr_async_completed( asyncBlock, &hr, &payload )) return E_PENDING;
+    *installationMonitor = SUCCEEDED( hr ) ? payload : NULL;
+    return hr;
 }
 
 static HRESULT WINAPI x_package_XPackageEstimateDownloadSize( IXPackageImpl3 *iface, const char *packageIdentifier, UINT32 selectorCount, XPackageChunkSelector *selectors, UINT64 *downloadSize, BOOLEAN *shouldPresentUserConfirmation )
 {
-    FIXME( "iface %p, packageIdentifier %s, selectorCount %u, selectors %p, downloadSize %p, shouldPresentUserConfirmation %p stub!\n", iface, packageIdentifier, selectorCount, selectors, downloadSize, shouldPresentUserConfirmation );
-    return E_NOTIMPL;
+    TRACE( "iface %p, packageIdentifier %s, selectorCount %u, downloadSize %p.\n", iface, debugstr_a( packageIdentifier ), selectorCount, downloadSize );
+
+    if (downloadSize) *downloadSize = 0;
+    if (shouldPresentUserConfirmation) *shouldPresentUserConfirmation = FALSE;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageUninstallChunks( IXPackageImpl3 *iface, const char *packageIdentifier, UINT32 selectorCount, XPackageChunkSelector *selectors )
 {
-    FIXME( "iface %p, packageIdentifier %s, selectorCount %u, selectores %p stub!\n", iface, packageIdentifier, selectorCount, selectors );
-    return E_NOTIMPL;
+    TRACE( "iface %p, packageIdentifier %s, selectorCount %u.\n", iface, debugstr_a( packageIdentifier ), selectorCount );
+    /* refuse to remove the content that is running the game -- but not an error */
+    return S_OK;
 }
 
 static HRESULT WINAPI __PADDING__( IXPackageImpl3 *iface )
 {
-    WARN( "iface %p padding function called! It's unknown what this function does.\n", iface );
+    WARN( "iface %p padding function called!\n", iface );
     return E_NOTIMPL;
 }
 
 static HRESULT WINAPI __PADDING_2__( IXPackageImpl3 *iface )
 {
-    WARN( "iface %p padding function called! It's unknown what this function does.\n", iface );
+    WARN( "iface %p padding function called!\n", iface );
     return E_NOTIMPL;
 }
 
 static BOOLEAN WINAPI x_package_XPackageUnregisterPackageInstalled( IXPackageImpl3 *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
-    FIXME( "iface %p, token %p, wait %d stub!\n", iface, &token, wait );
+    TRACE( "iface %p, wait %d.\n", iface, wait );
     return TRUE;
 }
 
 static HRESULT WINAPI __PADDING_3__( IXPackageImpl3 *iface )
 {
-    WARN( "iface %p padding function called! It's unknown what this function does.\n", iface );
+    WARN( "iface %p padding function called!\n", iface );
     return E_NOTIMPL;
 }
 
+/* ---- mount (of the installed content) ----------------------------------- */
+
 static HRESULT WINAPI x_package_XPackageGetMountPathSize( IXPackageImpl3 *iface, XPackageMountHandle mount, SIZE_T *pathSize )
 {
-    FIXME( "iface %p, mount %p, pathSize %p stub!\n", iface, mount, pathSize );
-    return E_NOTIMPL;
+    struct x_package_mount *m = (struct x_package_mount *)mount;
+
+    TRACE( "iface %p, mount %p, pathSize %p.\n", iface, mount, pathSize );
+
+    if (!m || !m->path || !pathSize) return E_INVALIDARG;
+    *pathSize = strlen( m->path ) + 1;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageGetMountPath( IXPackageImpl3 *iface, XPackageMountHandle mount, SIZE_T pathSize, char *path )
 {
-    FIXME( "iface %p, mount %p, pathSize %Iu, path %p stub!\n", iface, mount, pathSize, path );
-    return E_NOTIMPL;
+    struct x_package_mount *m = (struct x_package_mount *)mount;
+    SIZE_T len;
+
+    TRACE( "iface %p, mount %p, pathSize %Iu, path %p.\n", iface, mount, pathSize, path );
+
+    if (!m || !m->path || !path) return E_INVALIDARG;
+    len = strlen( m->path ) + 1;
+    if (pathSize < len) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+    memcpy( path, m->path, len );
+    TRACE( "-> %s\n", debugstr_a( m->path ) );
+    return S_OK;
 }
 
 static void WINAPI x_package_XPackageCloseMountHandle( IXPackageImpl3 *iface, XPackageMountHandle mount )
 {
-    FIXME( "iface %p, mount %p stub!\n", iface, mount );
+    struct x_package_mount *m = (struct x_package_mount *)mount;
+
+    TRACE( "iface %p, mount %p.\n", iface, mount );
+    if (!m) return;
+    free( m->path );
+    free( m );
 }
 
 static HRESULT WINAPI __PADDING_4__( IXPackageImpl3 *iface )
 {
-    WARN( "iface %p padding function called! It's unknown what this function does.\n", iface );
+    WARN( "iface %p padding function called!\n", iface );
     return E_NOTIMPL;
+}
+
+/* ---- enumeration -------------------------------------------------------- */
+
+static HRESULT enumerate_current( XPackageKind kind, void *context, XPackageEnumerationCallback *callback )
+{
+    XPackageDetails details;
+    char *identifier, display[256], title_id[64];
+
+    if (!callback) return E_INVALIDARG;
+    /* only games are installed here; a Content query finds nothing */
+    if (kind != XPackageKind_Game) return S_OK;
+
+    if (!(identifier = xgr_package_family())) return S_OK;
+    if (!config_attr( "<Identity", " Name=\"", display, sizeof(display) )) strcpy( display, "Game" );
+    if (!config_element( "TitleId", title_id, sizeof(title_id) )) title_id[0] = 0;
+
+    fill_current_details( &details, identifier, display, title_id );
+    TRACE( "reporting package %s (%s), title %s\n", debugstr_a( identifier ), debugstr_a( display ), debugstr_a( title_id ) );
+    callback( context, &details );
+    free( identifier );
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageEnumeratePackages( IXPackageImpl3 *iface, XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
 {
-    FIXME( "iface %p, kind %d, scope %d, context %p, callback %p stub!\n", iface, kind, scope, context, callback );
-    return E_NOTIMPL;
+    TRACE( "iface %p, kind %d, scope %d, context %p, callback %p.\n", iface, kind, scope, context, callback );
+    return enumerate_current( kind, context, callback );
 }
 
 static HRESULT WINAPI x_package_XPackageRegisterPackageInstalled( IXPackageImpl3 *iface, XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, queue %p, context %p, callback %p, token %p stub!\n", iface, queue, context, callback, token );
-    return E_NOTIMPL;
+    TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
+    /* the one package is already installed, so no install event ever fires */
+    if (token) token->token = 1;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageGetWriteStats( IXPackageImpl3 *iface, XPackageWriteStats *writeStats )
 {
-    FIXME( "iface %p, writeStats %p stub!\n", iface, writeStats );
-    return E_NOTIMPL;
+    TRACE( "iface %p, writeStats %p.\n", iface, writeStats );
+
+    if (!writeStats) return E_INVALIDARG;
+    memset( writeStats, 0, sizeof(*writeStats) );
+    return S_OK;
 }
 
 static HRESULT WINAPI __PADDING_5__( IXPackageImpl3 *iface )
 {
-    WARN( "iface %p padding function called! It's unknown what this function does.\n", iface );
+    WARN( "iface %p padding function called!\n", iface );
     return E_NOTIMPL;
 }
 
 static HRESULT WINAPI x_package_XPackageUninstallUWPInstance( IXPackageImpl3 *iface, const char *packageName )
 {
-    FIXME( "iface %p, packageName %s stub!\n", iface, debugstr_a( packageName ) );
-    return E_NOTIMPL;
+    TRACE( "iface %p, packageName %s.\n", iface, debugstr_a( packageName ) );
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageEnumerateFeatures( IXPackageImpl3 *iface, const char *packageIdentifier, void *context, XPackageFeatureEnumerationCallback *callback )
 {
-    FIXME( "iface %p, packageIdentifier %s, context %p, callback %p stub!\n", iface, packageIdentifier, context, callback );
-    return E_NOTIMPL;
+    TRACE( "iface %p, packageIdentifier %s, context %p, callback %p.\n", iface, debugstr_a( packageIdentifier ), context, callback );
+    /* no optional features declared */
+    return S_OK;
 }
 
 static BOOLEAN WINAPI x_package_XPackageUninstallPackage( IXPackageImpl3 *iface, const char *packageIdentifier )
 {
-    FIXME( "iface %p, packageIdentifier %s", iface, debugstr_a( packageIdentifier ) );
+    TRACE( "iface %p, packageIdentifier %s.\n", iface, debugstr_a( packageIdentifier ) );
     return FALSE;
 }
 
+/* ---- IXPackageImpl2 / Impl3 (same behaviour) ---------------------------- */
+
 static HRESULT WINAPI x_package_XPackageEnumeratePackages2( IXPackageImpl3 *iface, XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
 {
-    FIXME( "iface %p, kind %d, scope %d, context %p, callback %p stub!\n", iface, kind, scope, context, callback );
-    return E_NOTIMPL;
+    TRACE( "iface %p, kind %d, scope %d, context %p, callback %p.\n", iface, kind, scope, context, callback );
+    return enumerate_current( kind, context, callback );
 }
 
 static HRESULT WINAPI x_package_XPackageRegisterPackageInstalled2( IXPackageImpl3 *iface, XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, queue %p, context %p, callback %p, token %p stub!\n", iface, queue, context, callback, token );
-    return E_NOTIMPL;
+    TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
+    if (token) token->token = 1;
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageMountWithUiAsync( IXPackageImpl3 *iface, const char *packageIdentifier, XAsyncBlock *async )
 {
-    FIXME( "iface %p, packageIdentifier %s, async %p stub!\n", iface, debugstr_a( packageIdentifier ), async );
-    return E_NOTIMPL;
+    struct x_package_mount *mount;
+
+    TRACE( "iface %p, packageIdentifier %s, async %p.\n", iface, debugstr_a( packageIdentifier ), async );
+
+    if (!async) return E_INVALIDARG;
+    if (!(mount = calloc( 1, sizeof(*mount) )))
+    {
+        xgr_async_complete( async, E_OUTOFMEMORY, NULL );
+        return S_OK;
+    }
+    /* only the game's own content is present, so every mount resolves to the
+     * install root; a title mounting its own package gets a working path */
+    if (!(mount->path = current_mount_path()))
+    {
+        free( mount );
+        xgr_async_complete( async, HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE ), NULL );
+        return S_OK;
+    }
+    xgr_async_complete( async, S_OK, mount );
+    return S_OK;
 }
 
 static HRESULT WINAPI x_package_XPackageMountWithUiResult( IXPackageImpl3 *iface, XAsyncBlock *async, XPackageMountHandle *mount )
 {
-    FIXME( "iface %p, async %p, mount %p stub!\n", iface, async, mount );
-    return E_NOTIMPL;
+    void *payload;
+    HRESULT hr;
+
+    TRACE( "iface %p, async %p, mount %p.\n", iface, async, mount );
+
+    if (!mount) return E_INVALIDARG;
+    if (!xgr_async_completed( async, &hr, &payload )) return E_PENDING;
+    *mount = SUCCEEDED( hr ) ? (XPackageMountHandle)payload : NULL;
+    return hr;
 }
 
 static HRESULT WINAPI x_package_XPackageEnumeratePackages3( IXPackageImpl3 *iface, XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
 {
-    FIXME( "iface %p, kind %d, scope %d, context %p, callback %p stub!\n", iface, kind, scope, context, callback );
-    return E_NOTIMPL;
+    TRACE( "iface %p, kind %d, scope %d, context %p, callback %p.\n", iface, kind, scope, context, callback );
+    return enumerate_current( kind, context, callback );
 }
 
 static HRESULT WINAPI x_package_XPackageRegisterPackageInstalled3( IXPackageImpl3 *iface, XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    FIXME( "iface %p, queue %p, context %p, callback %p, token %p stub!\n", iface, queue, context, callback, token );
-    return E_NOTIMPL;
+    TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
+    if (token) token->token = 1;
+    return S_OK;
 }
 
 static const struct IXPackageImpl3Vtbl x_package_vtbl =
