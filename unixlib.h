@@ -69,10 +69,20 @@ struct license_token_params
     char token[XGR_LICENSE_TOKEN_MAX];
 };
 
+#define XGR_CATALOG_MAX (8 * 1024 * 1024)
+struct store_catalog_params
+{
+    const void *request;
+    ULONG request_size;
+    void *response;
+    ULONG response_size;
+};
+
 enum xgr_funcs
 {
     unix_xsts_token,
     unix_license_token,
+    unix_store_catalog,
     unix_funcs_count,
 };
 

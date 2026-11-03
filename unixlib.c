@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -463,10 +464,45 @@ done:
     return status;
 }
 
+/* Separate bounded catalog framing leaves all released IPC messages intact. */
+static NTSTATUS store_catalog( void *args )
+{
+    struct store_catalog_params *params = args;
+    unsigned char header[8];
+    unsigned int size;
+    long long deadline = license_now_ms() + 50000;
+    int fd;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    params->response_size = 0;
+    if (!params->request_size || params->request_size > 24000 || !params->response)
+        return STATUS_INVALID_PARAMETER;
+    if ((fd = connect_service()) < 0) return STATUS_NOT_FOUND;
+    fcntl(fd,F_SETFL,fcntl(fd,F_GETFL) | O_NONBLOCK);
+    errno = 0;
+    header[0] = 'C'; header[1] = 'S'; header[2] = 'D'; header[3] = 'X';
+    size = params->request_size;
+    header[4] = size; header[5] = size >> 8; header[6] = size >> 16; header[7] = size >> 24;
+    if (!license_io( fd, header, 8, TRUE, deadline ) ||
+        !license_io( fd, (void *)params->request, size, TRUE, deadline ) ||
+        !license_io( fd, header, 8, FALSE, deadline )) goto done;
+    if (memcmp( header, "CSDX", 4 )) goto done;
+    size = header[4] | ((unsigned int)header[5] << 8) | ((unsigned int)header[6] << 16) | ((unsigned int)header[7] << 24);
+    if (size < 12 || size > XGR_CATALOG_MAX) goto done;
+    if (!license_io( fd, params->response, size, FALSE, deadline )) goto done;
+    params->response_size = size;
+    status = STATUS_SUCCESS;
+done:
+    if (status && errno == ETIMEDOUT) status = STATUS_IO_TIMEOUT;
+    close( fd );
+    return status;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     xsts_token,
     license_token,
+    store_catalog,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
