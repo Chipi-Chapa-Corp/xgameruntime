@@ -21,8 +21,10 @@
 
 #include "private.h"
 
-/* for the WINHTTP_FLAG_SECURE_PROTOCOL_* mask the GDK reports below */
+/* for the WINHTTP_FLAG_SECURE_PROTOCOL_* mask the GDK reports below, and the
+ * request handles XNetworkingVerifyServerCertificate is given */
 #include <winhttp.h>
+#include <wincrypt.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 
@@ -130,9 +132,8 @@ static BOOLEAN WINAPI x_networking_XNetworkingUnregisterPreferredLocalUdpMultipl
  * itself from the observer map of an already-freed WebSocket. Joining from the
  * history or by IP never opens that socket, which is why only the menu froze.
  *
- * There is nothing to pin: XNetworkingVerifyServerCertificate below accepts the
- * connection, so report no thumbprints and let the caller do the ordinary TLS
- * validation it would otherwise do.
+ * There is nothing to pin: report no thumbprints, and let
+ * XNetworkingVerifyServerCertificate below do the ordinary TLS validation.
  *
  * The protocol flags are not a formality either. The GDK documents them as a
  * WINHTTP_FLAG_SECURE_PROTOCOL_* mask to be handed straight to
@@ -215,11 +216,218 @@ static HRESULT WINAPI x_networking_XNetworkingQuerySecurityInformationForUrlUtf1
                                         securityInformationBuffer, securityInformation );
 }
 
+/* XNetworkingVerifyServerCertificate.
+ *
+ * A title (libHttpClient's WinHTTP provider, in practice) calls this from its
+ * WINHTTP_CALLBACK_STATUS_SENDING_REQUEST callback with the request handle, and
+ * fails the request unless it succeeds. It used to succeed unconditionally,
+ * which made it no check at all. So the server's certificate is taken from the
+ * request and its chain verified against the request's host, under the SSL
+ * policy, the way WinHTTP verifies it while connecting -- including the
+ * SECURITY_FLAG_IGNORE_* exceptions the request carries, so a request WinHTTP
+ * was told to accept is accepted here too.
+ *
+ * Neither library is imported: the handle can only be a WinHTTP request if the
+ * title has winhttp.dll loaded, and crypt32.dll is loaded by it. A handle that
+ * is not a WinHTTP request, or a request with no server certificate (plain
+ * HTTP), cannot be checked here; that keeps the old answer, logged once.
+ *
+ * Thumbprint pinning is not checked. QuerySecurityInformationForUrl above
+ * reports none, so a title only has some to pass if it built its own. */
+static INIT_ONCE crypt32_once = INIT_ONCE_STATIC_INIT;
+static __typeof__(CertGetCertificateChain) *pCertGetCertificateChain;
+static __typeof__(CertVerifyCertificateChainPolicy) *pCertVerifyCertificateChainPolicy;
+static __typeof__(CertFreeCertificateChain) *pCertFreeCertificateChain;
+static __typeof__(CertFreeCertificateContext) *pCertFreeCertificateContext;
+
+static BOOL WINAPI load_crypt32( INIT_ONCE *once, void *param, void **context )
+{
+    HMODULE crypt32 = LoadLibraryW( L"crypt32.dll" );
+
+    if (!crypt32) return TRUE;
+    pCertGetCertificateChain = (void *)GetProcAddress( crypt32, "CertGetCertificateChain" );
+    pCertVerifyCertificateChainPolicy = (void *)GetProcAddress( crypt32, "CertVerifyCertificateChainPolicy" );
+    pCertFreeCertificateChain = (void *)GetProcAddress( crypt32, "CertFreeCertificateChain" );
+    pCertFreeCertificateContext = (void *)GetProcAddress( crypt32, "CertFreeCertificateContext" );
+    return TRUE;
+}
+
+static void cannot_verify( void *request, const char *why, DWORD error )
+{
+    static LONG logged;
+
+    if (!InterlockedExchange( &logged, 1 ))
+        WARN( "cannot verify the server certificate of %p (%s, error %lu); accepting it, as before.\n",
+              request, why, error );
+    else TRACE( "cannot verify the server certificate of %p (%s, error %lu).\n", request, why, error );
+}
+
+/* The host the request was made to, from its URL. */
+static BOOL request_host( __typeof__(WinHttpQueryOption) *query, __typeof__(WinHttpCrackUrl) *crack,
+                          HINTERNET request, WCHAR *host, DWORD host_len )
+{
+    URL_COMPONENTS parts = { sizeof(parts) };
+    DWORD size = 0;
+    WCHAR *url;
+    BOOL ret = FALSE;
+
+    query( request, WINHTTP_OPTION_URL, NULL, &size );
+    if (!size || !(url = calloc( 1, size + sizeof(WCHAR) ))) return FALSE;
+    parts.dwHostNameLength = ~0u;
+    if (query( request, WINHTTP_OPTION_URL, url, &size ) && crack( url, 0, 0, &parts ) &&
+        parts.lpszHostName && parts.dwHostNameLength && parts.dwHostNameLength < host_len)
+    {
+        memcpy( host, parts.lpszHostName, parts.dwHostNameLength * sizeof(WCHAR) );
+        host[parts.dwHostNameLength] = 0;
+        ret = TRUE;
+    }
+    free( url );
+    return ret;
+}
+
+/* The chain errors a request can carry, and the exception that lets it through.
+ * Each is weighed on its own: an ignored error must not hide one that is not,
+ * as it did when they were checked in turn (and as dlls/winhttp/net.c still
+ * does), so an expired certificate the request accepted from an unknown CA it
+ * did not accept was let through. Revocation has no exception. */
+static const struct
+{
+    DWORD trust_errors;
+    DWORD ignore;
+    DWORD error;
+}
+chain_errors[] =
+{
+    { CERT_TRUST_IS_NOT_TIME_VALID, SECURITY_FLAG_IGNORE_CERT_DATE_INVALID, ERROR_WINHTTP_SECURE_CERT_DATE_INVALID },
+    { CERT_TRUST_IS_UNTRUSTED_ROOT | CERT_TRUST_IS_PARTIAL_CHAIN, SECURITY_FLAG_IGNORE_UNKNOWN_CA,
+      ERROR_WINHTTP_SECURE_INVALID_CA },
+    { CERT_TRUST_IS_REVOKED, 0, ERROR_WINHTTP_SECURE_CERT_REVOKED },
+    { CERT_TRUST_IS_NOT_VALID_FOR_USAGE, SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE, ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE },
+};
+
+/* Revocation is looked up in the caches only (below), so not knowing is the
+ * usual answer, not a reason to refuse. */
+static const DWORD revocation_unknown = CERT_TRUST_IS_OFFLINE_REVOCATION | CERT_TRUST_REVOCATION_STATUS_UNKNOWN;
+
+/* WinHTTP's verdict: chain errors the request does not ignore first, then the
+ * SSL policy for the host.
+ *
+ * Revocation is checked from what the system already knows -- a status cached
+ * by an earlier online check, a CRL in the URL cache, or a local distribution
+ * point -- and never fetched: this runs on the title's thread, in the middle of
+ * sending its request. */
+static DWORD verify_chain( const CERT_CONTEXT *cert, WCHAR *host, DWORD security_flags )
+{
+    char oid_server_auth[] = szOID_PKIX_KP_SERVER_AUTH;
+    char *server_auth[] = { oid_server_auth };
+    CERT_CHAIN_PARA chain_para = { sizeof(chain_para) };
+    SSL_EXTRA_CERT_CHAIN_POLICY_PARA ssl = { {sizeof(ssl)} };
+    CERT_CHAIN_POLICY_PARA policy = { sizeof(policy) };
+    CERT_CHAIN_POLICY_STATUS status = { sizeof(status) };
+    const CERT_CHAIN_CONTEXT *chain;
+    CERT_CHAIN_CONTEXT copy;
+    DWORD errors, known = revocation_unknown, ignored, err = ERROR_SUCCESS;
+    unsigned int i;
+
+    chain_para.RequestedUsage.dwType = USAGE_MATCH_TYPE_AND;
+    chain_para.RequestedUsage.Usage.cUsageIdentifier = 1;
+    chain_para.RequestedUsage.Usage.rgpszUsageIdentifier = server_auth;
+    if (!pCertGetCertificateChain( NULL, cert, NULL, cert->hCertStore, &chain_para,
+                                   CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT |
+                                   CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY, NULL, &chain ))
+        return ERROR_WINHTTP_SECURE_CHANNEL_ERROR;
+
+    errors = chain->TrustStatus.dwErrorStatus;
+    ignored = errors & revocation_unknown;
+    for (i = 0; i < ARRAY_SIZE(chain_errors); i++)
+    {
+        known |= chain_errors[i].trust_errors;
+        if (!(errors & chain_errors[i].trust_errors)) continue;
+        if (chain_errors[i].ignore && (security_flags & chain_errors[i].ignore))
+            ignored |= errors & chain_errors[i].trust_errors;
+        else if (!err) err = chain_errors[i].error;
+    }
+    if (!err && (errors & ~known)) err = ERROR_WINHTTP_SECURE_INVALID_CERT;
+    if (err) TRACE( "chain errors %#lx, ignoring %#lx: %lu.\n", errors, ignored, err );
+
+    if (!err)
+    {
+        /* Only what was ignored above is hidden from the policy, so it still
+         * makes its other checks, the host name among them. */
+        copy = *chain;
+        copy.TrustStatus.dwErrorStatus &= ~ignored;
+        ssl.dwAuthType = AUTHTYPE_SERVER;
+        ssl.pwszServerName = host;
+        ssl.fdwChecks = security_flags;
+        policy.pvExtraPolicyPara = &ssl;
+        if (!pCertVerifyCertificateChainPolicy( CERT_CHAIN_POLICY_SSL, &copy, &policy, &status ))
+            err = ERROR_WINHTTP_SECURE_CHANNEL_ERROR;
+        else if (status.dwError == CERT_E_CN_NO_MATCH) err = ERROR_WINHTTP_SECURE_CERT_CN_INVALID;
+        else if (status.dwError) err = ERROR_WINHTTP_SECURE_INVALID_CERT;
+    }
+    pCertFreeCertificateChain( chain );
+    return err;
+}
+
 static HRESULT WINAPI x_networking_XNetworkingVerifyServerCertificate( IXNetworkingImpl2 *iface, void *requestHandle, const XNetworkingSecurityInformation *securityInformation )
 {
+    static const DWORD ignorable = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+                                   SECURITY_FLAG_IGNORE_CERT_CN_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+    __typeof__(WinHttpQueryOption) *query;
+    __typeof__(WinHttpCrackUrl) *crack;
+    const CERT_CONTEXT *cert = NULL;
+    DWORD size, flags = 0, err;
+    WCHAR host[256] = {0};
+    HMODULE winhttp;
+    HRESULT hr;
+
     TRACE( "iface %p, requestHandle %p, securityInformation %p.\n", iface, requestHandle, securityInformation );
-    /* no Xbox Live cert pinning offline; accept the connection */
-    return S_OK;
+
+    if (securityInformation && securityInformation->thumbprintCount)
+        FIXME( "%Iu certificate thumbprints not checked.\n", securityInformation->thumbprintCount );
+
+    InitOnceExecuteOnce( &crypt32_once, load_crypt32, NULL, NULL );
+    if (!pCertGetCertificateChain || !pCertVerifyCertificateChainPolicy || !pCertFreeCertificateChain ||
+        !pCertFreeCertificateContext)
+    {
+        cannot_verify( requestHandle, "no crypt32", 0 );
+        return S_OK;
+    }
+    /* Held for the call, so the title cannot unload it from under us. */
+    if (!requestHandle || !GetModuleHandleExW( 0, L"winhttp.dll", &winhttp ))
+    {
+        cannot_verify( requestHandle, "not a WinHTTP request", 0 );
+        return S_OK;
+    }
+    query = (void *)GetProcAddress( winhttp, "WinHttpQueryOption" );
+    crack = (void *)GetProcAddress( winhttp, "WinHttpCrackUrl" );
+    size = sizeof(cert);
+    if (!query || !crack || !query( requestHandle, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &cert, &size ) || !cert)
+    {
+        cannot_verify( requestHandle, "no server certificate", GetLastError() );
+        FreeLibrary( winhttp );
+        return S_OK;
+    }
+    size = sizeof(flags);
+    if (!query( requestHandle, WINHTTP_OPTION_SECURITY_FLAGS, &flags, &size )) flags = 0;
+    flags &= ignorable;
+
+    if (!request_host( query, crack, requestHandle, host, ARRAY_SIZE(host) ))
+    {
+        /* The certificate is from a connection WinHTTP made to some host; with
+         * no way to name it, the name check has nothing to compare against. */
+        WARN( "no host for request %p; verifying the chain without its name.\n", requestHandle );
+        err = verify_chain( cert, NULL, flags | SECURITY_FLAG_IGNORE_CERT_CN_INVALID );
+    }
+    else err = verify_chain( cert, host, flags );
+
+    pCertFreeCertificateContext( cert );
+    FreeLibrary( winhttp );
+
+    hr = err ? HRESULT_FROM_WIN32( err ) : S_OK;
+    if (FAILED(hr)) WARN( "server certificate of %p for %s refused: %#lx.\n", requestHandle, debugstr_w( host ), hr );
+    else TRACE( "server certificate of %p for %s verified (ignoring %#lx).\n", requestHandle, debugstr_w( host ), flags );
+    return hr;
 }
 
 /* Report a plain, unmetered wired connection. Titles gate HTTP startup on this:

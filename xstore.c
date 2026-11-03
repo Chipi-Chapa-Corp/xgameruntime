@@ -731,7 +731,7 @@ static BOOLEAN WINAPI x_store_XStoreIsLicenseValid( IXStoreImpl6 *iface, const X
     TRACE( "iface %p, storeLicenseHandle %p.\n", iface, storeLicenseHandle );
     if (lic && lic->verified)
     {
-        if (xgr_role_entitlement(&active)) lic->valid = !!active;
+        if (xgr_role_entitlement(&active, TRUE)) lic->valid = !!active;
         return lic->valid;
     }
     return lic && lic->valid;
@@ -1174,7 +1174,7 @@ static HRESULT WINAPI x_store_XStoreRegisterGameLicenseChanged( IXStoreImpl6 *if
         if (!storeContextHandle || !xgr_config_element("StoreId",store_id,sizeof(store_id))) return E_INVALIDARG;
         /* No request here: the watch takes the first answer as its baseline. */
         return xgr_role_watch_register(XGR_ROLE_WATCH_GAME,storeContextHandle,queue,context,NULL,callback,
-            xgr_role_entitlement(&active) ? (int)!!active : -1,token);
+            xgr_role_entitlement(&active, FALSE) ? (int)!!active : -1,token);
     }
     /* Legacy mode has no live Store state. */
     if (token) token->token = 1;

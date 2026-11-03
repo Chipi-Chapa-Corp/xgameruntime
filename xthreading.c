@@ -1043,6 +1043,61 @@ static void queue_finish( struct x_task_queue *queue )
     }
 }
 
+/* Provider work that must not run where DoWork was dispatched.
+ *
+ * In strict manual mode an operation's DoWork runs on the title's own Work
+ * port, so a provider whose work blocks -- a service round trip with a long
+ * deadline -- blocks the title's dispatch thread and everything queued behind
+ * it. Such a provider hands the blocking part here from DoWork and returns
+ * E_PENDING; the work runs on the pool, or a thread of its own when the pool
+ * refuses, and completes the operation itself.
+ *
+ * It is still the queue's work, exactly as provider work is in the other
+ * modes: the block's queue counts it until it returns, so terminating the
+ * queue waits for it, and the terminated callback cannot overtake its
+ * completion. */
+struct x_detached_work
+{
+    struct x_task_queue *queue;
+    PTP_SIMPLE_CALLBACK callback;
+    void *context;
+};
+
+static void CALLBACK detached_work_callback( TP_CALLBACK_INSTANCE *instance, void *arg )
+{
+    struct x_detached_work *work = arg;
+    struct x_task_queue *queue = work->queue;
+
+    work->callback( instance, work->context );
+    free( work );
+    if (queue) queue_finish( queue );
+}
+
+HRESULT xgr_async_run_detached( XAsyncBlock *async, PTP_SIMPLE_CALLBACK callback, void *context )
+{
+    struct x_detached_work *work;
+    struct x_async_op *op;
+    HRESULT hr;
+
+    if (!async || !callback) return E_INVALIDARG;
+    if (!(work = calloc( 1, sizeof(*work) ))) return E_OUTOFMEMORY;
+    work->callback = callback;
+    work->context = context;
+    if ((op = acquire_async_op( async )))
+    {
+        work->queue = (struct x_task_queue *)op->route.queue;
+        release_async_op( op );
+    }
+    if (work->queue) queue_hold( work->queue );
+
+    if (TrySubmitThreadpoolCallback( detached_work_callback, work, NULL )) return S_OK;
+    if (SUCCEEDED(hr = run_off_pool( detached_work_callback, work ))) return S_OK;
+
+    if (work->queue) queue_finish( work->queue );
+    free( work );
+    return hr;
+}
+
 /* Block until everything the queue owes has returned.
  *
  * Work still running can complete an operation on this queue while we wait,

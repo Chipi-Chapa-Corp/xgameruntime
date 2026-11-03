@@ -112,6 +112,10 @@ HRESULT WINAPI QueryApiImpl( const GUID *classId, REFIID interfaceId, void **out
 void xgr_async_complete( XAsyncBlock *async, HRESULT hr, void *payload );
 /* Same, also recording the buffer size XAsyncGetResultSize should report. */
 void xgr_async_complete_ex( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size );
+/* From a provider's DoWork: run `callback` off the thread that dispatched it,
+ * counted as the block's queue's work, and let it complete the operation. On
+ * failure nothing runs and the caller does the work itself. */
+HRESULT xgr_async_run_detached( XAsyncBlock *async, PTP_SIMPLE_CALLBACK callback, void *context );
 
 /* Inline MicrosoftGame.config text from InitializeApiImplEx2, or NULL. */
 extern char *xgr_game_config;
@@ -173,7 +177,9 @@ BOOLEAN xgr_role_watch_unregister(enum xgr_role_watch_kind, void *, XTaskQueueRe
 void xgr_role_watch_close(enum xgr_role_watch_kind, void *);
 /* The Store account's entitlement to the running game as last answered by the
  * service, kept off the title's threads (xuser.c). FALSE while nothing
- * definitive is known. Store requests that ask the service themselves feed
- * their answer back with the unix call's status. */
-BOOL xgr_role_entitlement( UINT32 *active );
+ * definitive is known. With `fresh`, a question after a quiet spell waits a
+ * bounded time for a current answer (see role_state_get). Store requests that
+ * ask the service themselves feed their answer back with the unix call's
+ * status. */
+BOOL xgr_role_entitlement( UINT32 *active, BOOL fresh );
 void xgr_role_entitlement_store( LONG status /* NTSTATUS */, UINT32 active );

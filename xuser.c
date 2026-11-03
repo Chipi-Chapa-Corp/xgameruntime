@@ -297,10 +297,26 @@ static BOOL get_live_identity( UINT64 *xuid, char *gamertag, SIZE_T gamertag_siz
  * to read as a sign-out or a lost licence, and a licence handle never recovered
  * from it. An answer in a protocol version this side cannot read is
  * definitive, and fails closed. A source is polled while something watches it
- * or a title asked about it in the last half minute. */
+ * or a title asked about it in the last half minute.
+ *
+ * Outside that window nothing polls, so what is kept can be as old as the
+ * last question. A title checking its licence once a minute with nothing
+ * registered would then be told about a Store sign-out a whole question late,
+ * and a sign-in likewise. So the first question after a quiet spell -- when
+ * nothing has asked the service for ROLE_FRESH_MS -- wakes the poller and
+ * waits for its answer, for at most ROLE_STALE_WAIT_MS; a service that does
+ * not answer in time gets the last state, as during any outage. Freshness
+ * bound, then: while polled, about ROLE_POLL_MS plus one exchange; after a
+ * quiet spell, current unless the service took longer than the wait. */
 enum role_source { ROLE_SOURCE_ACCOUNTS, ROLE_SOURCE_ENTITLEMENT, ROLE_SOURCE_COUNT };
-#define ROLE_POLL_MS   1000
-#define ROLE_DEMAND_MS 30000
+#define ROLE_POLL_MS       1000
+#define ROLE_DEMAND_MS     30000
+#define ROLE_FRESH_MS      3000
+#define ROLE_STALE_WAIT_MS 1000
+
+/* What a caller of role_state_get wants. */
+#define ROLE_GET_SEED  0x1  /* ask synchronously if there has never been an answer */
+#define ROLE_GET_FRESH 0x2  /* after a quiet spell, wait (bounded) for a current answer */
 
 static struct role_source_state
 {
@@ -308,10 +324,13 @@ static struct role_source_state
     struct account_roles_params roles;  /* ROLE_SOURCE_ACCOUNTS */
     UINT32 active;                      /* ROLE_SOURCE_ENTITLEMENT */
     ULONGLONG wanted_until;
+    ULONGLONG checked_at;               /* when the last exchange ended, whatever it said */
+    LONG generation;                    /* counts those exchanges */
     LONG watchers;
     HANDLE wake;
 } role_state[ROLE_SOURCE_COUNT];
 static SRWLOCK role_state_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE role_state_checked = CONDITION_VARIABLE_INIT;
 
 static void role_watches_update( enum role_source source );
 
@@ -336,6 +355,17 @@ static BOOL role_state_store( enum role_source source, NTSTATUS status,
     return TRUE;
 }
 
+/* An exchange with the service has ended, answered or not: whoever waits for a
+ * current answer can stop waiting. */
+static void role_state_note_checked( enum role_source source )
+{
+    AcquireSRWLockExclusive( &role_state_lock );
+    role_state[source].checked_at = GetTickCount64();
+    role_state[source].generation++;
+    ReleaseSRWLockExclusive( &role_state_lock );
+    WakeAllConditionVariable( &role_state_checked );
+}
+
 static NTSTATUS role_state_fetch( enum role_source source )
 {
     struct store_entitlement_params entitlement = {{0}};
@@ -347,6 +377,7 @@ static NTSTATUS role_state_fetch( enum role_source source )
         return STATUS_NOT_FOUND;
     else status = XGR_UNIX_CALL( store_entitlement, &entitlement );
     role_state_store( source, status, &roles, entitlement.active );
+    role_state_note_checked( source );
     return status;
 }
 
@@ -384,16 +415,21 @@ static DWORD WINAPI role_poller( void *arg )
 }
 
 /* Note that a title cares about a source -- `watchers` adds or drops a
- * standing interest -- and make sure something is polling it. */
-static void role_source_want( enum role_source source, LONG watchers )
+ * standing interest -- and make sure something is polling it. Returns TRUE
+ * when what is kept may be stale: nothing was polling it, and nothing has
+ * asked the service for a while. `generation` then says which exchange a
+ * fresher answer has to come after. */
+static BOOL role_source_want( enum role_source source, LONG watchers, LONG *generation )
 {
     struct role_source_state *state = &role_state[source];
     ULONGLONG now = GetTickCount64();
-    BOOL idle, start = FALSE;
+    BOOL idle, stale, start = FALSE;
     HANDLE thread;
 
     AcquireSRWLockExclusive( &role_state_lock );
     idle = state->watchers <= 0 && now >= state->wanted_until;
+    stale = idle && now - state->checked_at >= ROLE_FRESH_MS;
+    if (generation) *generation = state->generation;
     state->watchers += watchers;
     if (watchers >= 0) state->wanted_until = now + ROLE_DEMAND_MS;
     if (!state->started && (state->wake = CreateEventW( NULL, FALSE, FALSE, NULL )))
@@ -408,34 +444,53 @@ static void role_source_want( enum role_source source, LONG watchers )
         else ERR( "could not start the role poller: %lu.\n", GetLastError() );
     }
     else if (idle && watchers >= 0 && state->wake) SetEvent( state->wake );
+    return stale && watchers >= 0 && state->wake;
 }
 
-/* The last definitive answer, if there has been one. With `seed`, a source
- * that has never answered is asked once, synchronously and bounded, so the
- * first question of a process does not have to wait for a poll. */
-static BOOL role_state_get( enum role_source source, BOOL seed, struct account_roles_params *roles, UINT32 *active )
+/* The last definitive answer, if there has been one. With ROLE_GET_SEED, a
+ * source that has never answered is asked once, synchronously and bounded, so
+ * the first question of a process does not have to wait for a poll. With
+ * ROLE_GET_FRESH, the first question after a quiet spell waits a bounded time
+ * for the poller's next answer rather than reporting one from before it. */
+static BOOL role_state_get( enum role_source source, DWORD flags, struct account_roles_params *roles, UINT32 *active )
 {
-    BOOL ask;
+    struct role_source_state *state = &role_state[source];
+    ULONGLONG deadline, now;
+    LONG generation;
+    BOOL ask, stale;
 
-    role_source_want( source, 0 );
-    if (role_state_peek( source, roles, active )) return TRUE;
-    if (!seed) return FALSE;
+    stale = role_source_want( source, 0, &generation );
+    if (role_state_peek( source, roles, active ))
+    {
+        if (!stale || !(flags & ROLE_GET_FRESH)) return TRUE;
+        AcquireSRWLockExclusive( &role_state_lock );
+        deadline = GetTickCount64() + ROLE_STALE_WAIT_MS;
+        while (state->generation == generation && (now = GetTickCount64()) < deadline)
+            SleepConditionVariableSRW( &role_state_checked, &role_state_lock, deadline - now, 0 );
+        if (state->generation == generation)
+            TRACE( "role source %u did not answer within %u ms; reporting the last state.\n",
+                   source, ROLE_STALE_WAIT_MS );
+        ReleaseSRWLockExclusive( &role_state_lock );
+        return role_state_peek( source, roles, active );
+    }
+    if (!(flags & ROLE_GET_SEED)) return FALSE;
     AcquireSRWLockExclusive( &role_state_lock );
-    ask = !role_state[source].seeded;
-    role_state[source].seeded = TRUE;
+    ask = !state->seeded;
+    state->seeded = TRUE;
     ReleaseSRWLockExclusive( &role_state_lock );
     if (ask) role_state_fetch( source );
     return role_state_peek( source, roles, active );
 }
 
-BOOL xgr_role_entitlement( UINT32 *active )
+BOOL xgr_role_entitlement( UINT32 *active, BOOL fresh )
 {
-    return role_state_get( ROLE_SOURCE_ENTITLEMENT, FALSE, NULL, active );
+    return role_state_get( ROLE_SOURCE_ENTITLEMENT, fresh ? ROLE_GET_FRESH : 0, NULL, active );
 }
 
 void xgr_role_entitlement_store( NTSTATUS status, UINT32 active )
 {
     role_state_store( ROLE_SOURCE_ENTITLEMENT, status, NULL, active );
+    role_state_note_checked( ROLE_SOURCE_ENTITLEMENT );
 }
 
 static HRESULT WINAPI x_user_XUserDuplicateHandle( IXUserImpl6 *iface, XUserHandle handle, XUserHandle *duplicatedHandle )
@@ -483,7 +538,7 @@ static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl6 *iface, XUserAddOptions 
          * signed in at all (bounded by the unix call's own deadline); a
          * failed exchange falls back to the last answer there was. */
         role_state_fetch( ROLE_SOURCE_ACCOUNTS );
-        if (!role_state_get( ROLE_SOURCE_ACCOUNTS, FALSE, &roles, NULL ) || !roles.player_signed_in)
+        if (!role_state_get( ROLE_SOURCE_ACCOUNTS, 0, &roles, NULL ) || !roles.player_signed_in)
             return HRESULT_FROM_WIN32(ERROR_NO_SUCH_LOGON_SESSION);
     }
     /* The identity is wanted next; get it going while the title carries on. */
@@ -572,7 +627,8 @@ static HRESULT WINAPI x_user_XUserGetState( IXUserImpl6 *iface, XUserHandle user
     if (!is_local_user( user ) || !state) return E_INVALIDARG;
     /* The handle was issued signed in; only a definitive answer changes that. */
     *state = XUserState_SignedIn;
-    if (account_roles_enabled() && role_state_get( ROLE_SOURCE_ACCOUNTS, TRUE, &roles, NULL ) &&
+    if (account_roles_enabled() &&
+        role_state_get( ROLE_SOURCE_ACCOUNTS, ROLE_GET_SEED | ROLE_GET_FRESH, &roles, NULL ) &&
         !roles.player_signed_in)
         *state = XUserState_SignedOut;
     return S_OK;
@@ -641,10 +697,19 @@ static HRESULT WINAPI x_user_XUserResolvePrivilegeWithUiResult( IXUserImpl6 *ifa
  * (Minecraft spun on its PlayFab sign-in tens of thousands of times).
  *
  * The request is an XAsyncBegin operation. The *Async call copies what it
- * needs and returns; the round trip to the service is the operation's DoWork,
- * scheduled on the caller's queue like any other async work, never done on the
- * calling thread. The provider owns the result until the caller takes it, and
- * Cleanup releases it. It used to be handed to the block and never freed -- a
+ * needs and returns, and the operation's DoWork is scheduled on the caller's
+ * queue like any other async work. DoWork itself only hands the round trip to
+ * a thread of ours and returns: the exchange can take up to 65 s with its
+ * retries, and in strict manual mode (XGR_STRICT_MANUAL_QUEUES, Halo Infinite)
+ * DoWork runs on the title's own Work port, so doing it there held the
+ * title's dispatch thread -- and everything queued behind it -- for that long
+ * when the service stalled. That thread completes the operation, and nothing
+ * else does, so the request stays alive until it has; it is still the queue's
+ * work, so terminating the queue waits for it as before. Cancel is not
+ * honoured, as before: the exchange is bounded and finishes on its own.
+ *
+ * The provider owns the result until the caller takes it, and Cleanup
+ * releases it. It used to be handed to the block and never freed -- a
  * few KB, bearer token included, left behind for every Xbox Live call a title
  * made. As with every provider-driven operation, taking the result consumes
  * it. The narrow and UTF-16 entry points lay the result out differently, so
@@ -653,6 +718,7 @@ static HRESULT WINAPI x_user_XUserResolvePrivilegeWithUiResult( IXUserImpl6 *ifa
 struct token_request
 {
     struct xsts_token_params params;
+    XAsyncBlock *async;                /* set when DoWork hands the request off */
     char *url, *method;
     void *body;
     BOOL wide;
@@ -714,32 +780,51 @@ static void token_fill_result( const struct token_request *req, void *buffer )
     }
 }
 
+/* The round trip itself, off the title's threads. */
+static void token_request_run( struct token_request *req )
+{
+    HRESULT hr = S_OK;
+
+    if (XGR_UNIX_CALL( xsts_token, &req->params )) hr = E_GAMEUSER_NO_AUTH_USER;
+    else
+    {
+        req->token_len = strlen( req->params.token );
+        req->signature_len = strlen( req->params.signature );
+        if (req->wide &&
+            (!(req->token_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.token, -1, NULL, 0 )) ||
+             (req->signature_len &&
+              !(req->signature_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.signature, -1, NULL, 0 )))))
+            hr = HRESULT_FROM_WIN32( GetLastError() );
+        else
+            TRACE( "issued a token for %s %s%s.\n", debugstr_a( req->method ), debugstr_a( req->url ),
+                   req->signature_len ? " (signed)" : "" );
+    }
+    /* Completion may release the request on another thread: the last use. */
+    IXThreadingImpl_XAsyncComplete( x_threading_impl, req->async, hr, SUCCEEDED(hr) ? token_result_size( req ) : 0 );
+}
+
+static void CALLBACK token_request_detached( TP_CALLBACK_INSTANCE *instance, void *context )
+{
+    token_request_run( context );
+}
+
 static HRESULT CALLBACK token_provider( XAsyncOp op, const XAsyncProviderData *data )
 {
     struct token_request *req = data->context;
-    HRESULT hr = S_OK;
+    HRESULT hr;
 
     switch (op)
     {
     case XAsyncOp_Begin:
         return IXThreadingImpl_XAsyncSchedule( x_threading_impl, data->async, 0 );
     case XAsyncOp_DoWork:
-        if (XGR_UNIX_CALL( xsts_token, &req->params )) hr = E_GAMEUSER_NO_AUTH_USER;
-        else
+        req->async = data->async;
+        pin_module();
+        if (FAILED(hr = xgr_async_run_detached( data->async, token_request_detached, req )))
         {
-            req->token_len = strlen( req->params.token );
-            req->signature_len = strlen( req->params.signature );
-            if (req->wide &&
-                (!(req->token_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.token, -1, NULL, 0 )) ||
-                 (req->signature_len &&
-                  !(req->signature_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.signature, -1, NULL, 0 )))))
-                hr = HRESULT_FROM_WIN32( GetLastError() );
-            else
-                TRACE( "issued a token for %s %s%s.\n", debugstr_a( req->method ), debugstr_a( req->url ),
-                       req->signature_len ? " (signed)" : "" );
+            WARN( "no thread for the token request (%#lx); asking on this one.\n", hr );
+            token_request_run( req );
         }
-        /* Completion may release the context on another thread. */
-        IXThreadingImpl_XAsyncComplete( x_threading_impl, data->async, hr, SUCCEEDED(hr) ? token_result_size( req ) : 0 );
         return E_PENDING;
     case XAsyncOp_GetResult:
         token_fill_result( req, data->buffer );
@@ -1044,7 +1129,7 @@ HRESULT xgr_role_watch_register( enum xgr_role_watch_kind kind, void *owner, XTa
     watch->next = role_watches; role_watches = watch;
     token->token = watch->token;
     ReleaseSRWLockExclusive(&role_watches_lock);
-    role_source_want(role_watch_source(kind),1);
+    role_source_want(role_watch_source(kind),1,NULL);
     return S_OK;
 }
 
@@ -1059,7 +1144,7 @@ BOOLEAN xgr_role_watch_unregister( enum xgr_role_watch_kind kind, void *owner,
         { watch = *link; *link = watch->next; break; }
     ReleaseSRWLockExclusive(&role_watches_lock);
     if (!watch) return TRUE;
-    role_source_want(role_watch_source(kind),-1);
+    role_source_want(role_watch_source(kind),-1,NULL);
     EnterCriticalSection(&watch->lock);
     watch->stopped = TRUE;
     while (wait && watch->callback_thread && watch->callback_thread != GetCurrentThreadId())
@@ -1093,7 +1178,7 @@ static HRESULT WINAPI x_user_XUserRegisterForChangeEvent( IXUserImpl6 *iface, XT
     TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
     if (account_roles_enabled())
         return xgr_role_watch_register(XGR_ROLE_WATCH_USER,NULL,queue,context,callback,NULL,
-            role_state_get(ROLE_SOURCE_ACCOUNTS,TRUE,&roles,NULL) ? (int)roles.player_signed_in : -1,token);
+            role_state_get(ROLE_SOURCE_ACCOUNTS,ROLE_GET_SEED,&roles,NULL) ? (int)roles.player_signed_in : -1,token);
     /* The legacy local user never changes. */
     if (token) token->token = 1;
     return S_OK;
@@ -1154,7 +1239,8 @@ static BOOLEAN WINAPI x_user_XUserIsStoreUser( IXUserImpl6 *iface, XUserHandle u
 
     TRACE( "iface %p, user %p.\n", iface, user );
     if (account_roles_enabled())
-        return is_local_user(user) && role_state_get(ROLE_SOURCE_ACCOUNTS,TRUE,&roles,NULL) && roles.same_store_user;
+        return is_local_user(user) &&
+            role_state_get(ROLE_SOURCE_ACCOUNTS,ROLE_GET_SEED|ROLE_GET_FRESH,&roles,NULL) && roles.same_store_user;
     return is_local_user( user );  /* the local user owns the title from the store */
 }
 
