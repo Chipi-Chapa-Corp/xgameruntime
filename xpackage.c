@@ -267,7 +267,7 @@ static BOOL WINAPI init_package_identifier( INIT_ONCE *once, void *param, void *
  * package family names used for AppModel and save paths are a different API
  * and can exceed XPACKAGE_IDENTIFIER_MAX_LENGTH (33 including the NUL).
  * Share one identifier between the query and enumeration for this package. */
-static const char *package_identifier( void )
+const char *xgr_current_package_identifier( void )
 {
     static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
 
@@ -283,7 +283,7 @@ static HRESULT WINAPI x_package_XPackageGetCurrentProcessPackageIdentifier( IXPa
     TRACE( "iface %p, bufferSize %Iu, buffer %p.\n", iface, bufferSize, buffer );
 
     if (!buffer) return E_INVALIDARG;
-    if (!(id = package_identifier())) return HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE );
+    if (!(id = xgr_current_package_identifier())) return HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE );
     len = strlen( id ) + 1;
     if (bufferSize < len)
     {
@@ -525,7 +525,7 @@ static HRESULT enumerate_current( XPackageKind kind, void *context, XPackageEnum
     /* only games are installed here; a Content query finds nothing */
     if (kind != XPackageKind_Game) return S_OK;
 
-    if (!(identifier = package_identifier())) return HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE );
+    if (!(identifier = xgr_current_package_identifier())) return HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE );
 
     /* MicrosoftGame.config carries all of this. Reporting the package family
      * name as the display name and blanks for the rest is not harmless: a title

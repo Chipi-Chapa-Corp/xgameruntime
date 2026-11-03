@@ -118,6 +118,12 @@ static BOOL is_local_user( XUserHandle user )
     return user == local_user_handle();
 }
 
+static BOOL account_roles_enabled(void)
+{
+    char enabled[8];
+    return GetEnvironmentVariableA("XGR_ACCOUNT_ROLES_V1",enabled,sizeof(enabled)) && !strcmp(enabled,"1");
+}
+
 /* Offline there is no real XUID to report. XGR_XUID lets the launcher supply
  * the one the user's Windows install used, so on-disk layouts keyed by it --
  * the game save folders in particular -- line up with what Windows wrote. */
@@ -226,9 +232,12 @@ static HRESULT WINAPI x_user_XUserGetMaxUsers( IXUserImpl6 *iface, UINT32 *maxUs
 
 static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl6 *iface, XUserAddOptions options, XAsyncBlock *async )
 {
+    struct account_roles_params roles;
     TRACE( "iface %p, options %d, async %p.\n", iface, options, async );
 
     if (!async) return E_INVALIDARG;
+    if (account_roles_enabled() && (XGR_UNIX_CALL(account_roles,&roles) || !roles.player_signed_in))
+        return HRESULT_FROM_WIN32(ERROR_NO_SUCH_LOGON_SESSION);
 
     /* Nothing to negotiate for a local user, so complete before returning. */
     TRACE( "user handle async result: %Iu bytes.\n", sizeof(local_user_result) );
@@ -306,10 +315,13 @@ static HRESULT WINAPI x_user_XUserGetIsGuest( IXUserImpl6 *iface, XUserHandle us
 
 static HRESULT WINAPI x_user_XUserGetState( IXUserImpl6 *iface, XUserHandle user, XUserState *state )
 {
+    struct account_roles_params roles;
     TRACE( "iface %p, user %p, state %p.\n", iface, user, state );
 
     if (!is_local_user( user ) || !state) return E_INVALIDARG;
     *state = XUserState_SignedIn;
+    if (account_roles_enabled() && (XGR_UNIX_CALL(account_roles,&roles) || !roles.player_signed_in))
+        *state = XUserState_SignedOut;
     return S_OK;
 }
 
@@ -593,10 +605,180 @@ static HRESULT WINAPI x_user_XUserResolveIssueWithUiUtf16Result( IXUserImpl6 *if
     return E_NOTIMPL;
 }
 
+/* Profile-mode events poll authenticated state on the Work port and deliver
+ * notifications on the caller's Completion port. Registration owns one ref,
+ * polling and each queued notification own another. Unregister stops delivery
+ * even if a slow Store request is still finishing. */
+struct role_watch
+{
+    struct role_watch *next;
+    LONG refs;
+    UINT64 token;
+    enum xgr_role_watch_kind kind;
+    void *owner, *context;
+    XTaskQueueHandle queue;
+    XUserChangeEventCallback *user_callback;
+    XStoreGameLicenseChangedCallback *store_callback;
+    CRITICAL_SECTION lock;
+    CONDITION_VARIABLE idle;
+    BOOL stopped, state;
+    DWORD callback_thread;
+};
+struct role_notification { struct role_watch *watch; BOOL state; };
+static SRWLOCK role_watches_lock = SRWLOCK_INIT;
+static struct role_watch *role_watches;
+static UINT64 role_watch_next_token = 0x10000;
+
+static void role_watch_release( struct role_watch *watch )
+{
+    if (InterlockedDecrement(&watch->refs)) return;
+    if (watch->queue) IXThreadingImpl_XTaskQueueCloseHandle(x_threading_impl,watch->queue);
+    DeleteCriticalSection(&watch->lock);
+    free(watch);
+}
+
+static void CALLBACK role_watch_notify( void *context, BOOLEAN cancelled )
+{
+    struct role_notification *notification = context;
+    struct role_watch *watch = notification->watch;
+    XUserLocalId id = local_user.local_id;
+    BOOL deliver;
+
+    EnterCriticalSection(&watch->lock);
+    deliver = !cancelled && !watch->stopped;
+    if (deliver) watch->callback_thread = GetCurrentThreadId();
+    LeaveCriticalSection(&watch->lock);
+    if (deliver)
+    {
+        if (watch->kind == XGR_ROLE_WATCH_USER)
+            watch->user_callback(watch->context,id,notification->state ? XUserChangeEvent_SignedInAgain : XUserChangeEvent_SignedOut);
+        else watch->store_callback(watch->context);
+        EnterCriticalSection(&watch->lock);
+        watch->callback_thread = 0;
+        WakeAllConditionVariable(&watch->idle);
+        LeaveCriticalSection(&watch->lock);
+    }
+    free(notification);
+    role_watch_release(watch);
+}
+
+static void CALLBACK role_watch_poll( void *context, BOOLEAN cancelled )
+{
+    struct role_watch *watch = context;
+    struct role_notification *notification;
+    struct account_roles_params roles;
+    struct store_entitlement_params entitlement = {{0}};
+    BOOL stopped, state, changed;
+    HRESULT hr;
+
+    EnterCriticalSection(&watch->lock);
+    stopped = cancelled || watch->stopped;
+    LeaveCriticalSection(&watch->lock);
+    if (stopped) { role_watch_release(watch); return; }
+    if (watch->kind == XGR_ROLE_WATCH_USER)
+        state = !XGR_UNIX_CALL(account_roles,&roles) && roles.player_signed_in;
+    else
+    {
+        state = xgr_config_element("StoreId",entitlement.store_id,sizeof(entitlement.store_id)) &&
+            !XGR_UNIX_CALL(store_entitlement,&entitlement) && entitlement.active;
+    }
+    EnterCriticalSection(&watch->lock);
+    stopped = watch->stopped;
+    changed = !stopped && state != watch->state;
+    watch->state = state;
+    if (changed && (watch->kind != XGR_ROLE_WATCH_PACKAGE || !state) &&
+        (notification = malloc(sizeof(*notification))))
+    {
+        notification->watch = watch;
+        notification->state = state;
+        InterlockedIncrement(&watch->refs);
+        /* Submit outside the lock: Immediate queues may invoke reentrantly. */
+        LeaveCriticalSection(&watch->lock);
+        hr = IXThreadingImpl_XTaskQueueSubmitCallback(x_threading_impl,watch->queue,XTaskQueuePort_Completion,notification,role_watch_notify);
+        if (FAILED(hr)) { free(notification); role_watch_release(watch); }
+    }
+    else LeaveCriticalSection(&watch->lock);
+    if (!stopped && SUCCEEDED(IXThreadingImpl_XTaskQueueSubmitDelayedCallback(x_threading_impl,
+        watch->queue,XTaskQueuePort_Work,1000,watch,role_watch_poll))) return;
+    role_watch_release(watch);
+}
+
+HRESULT xgr_role_watch_register( enum xgr_role_watch_kind kind, void *owner, XTaskQueueHandle queue,
+    void *context, XUserChangeEventCallback *user_callback, XStoreGameLicenseChangedCallback *store_callback,
+    BOOL initial, XTaskQueueRegistrationToken *token )
+{
+    struct role_watch *watch;
+    HRESULT hr;
+    if (!token || (kind == XGR_ROLE_WATCH_USER ? !user_callback : !store_callback)) return E_INVALIDARG;
+    if (!(watch = calloc(1,sizeof(*watch)))) return E_OUTOFMEMORY;
+    if (queue && FAILED(hr = IXThreadingImpl_XTaskQueueDuplicateHandle(x_threading_impl,queue,&watch->queue)))
+    { free(watch); return hr; }
+    InitializeCriticalSection(&watch->lock);
+    InitializeConditionVariable(&watch->idle);
+    watch->refs = 2; /* registration plus polling chain */
+    watch->kind = kind; watch->owner = owner; watch->context = context;
+    watch->user_callback = user_callback; watch->store_callback = store_callback; watch->state = initial;
+    AcquireSRWLockExclusive(&role_watches_lock);
+    watch->token = ++role_watch_next_token;
+    watch->next = role_watches; role_watches = watch;
+    token->token = watch->token;
+    ReleaseSRWLockExclusive(&role_watches_lock);
+    hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback(x_threading_impl,watch->queue,
+        XTaskQueuePort_Work,1000,watch,role_watch_poll);
+    if (FAILED(hr))
+    {
+        xgr_role_watch_unregister(kind,owner,*token,TRUE);
+        role_watch_release(watch);
+    }
+    return hr;
+}
+
+BOOLEAN xgr_role_watch_unregister( enum xgr_role_watch_kind kind, void *owner,
+    XTaskQueueRegistrationToken token, BOOLEAN wait )
+{
+    struct role_watch **link, *watch = NULL;
+    BOOL idle;
+    AcquireSRWLockExclusive(&role_watches_lock);
+    for (link = &role_watches; *link; link = &(*link)->next)
+        if ((*link)->kind == kind && (*link)->owner == owner && (*link)->token == token.token)
+        { watch = *link; *link = watch->next; break; }
+    ReleaseSRWLockExclusive(&role_watches_lock);
+    if (!watch) return TRUE;
+    EnterCriticalSection(&watch->lock);
+    watch->stopped = TRUE;
+    while (wait && watch->callback_thread && watch->callback_thread != GetCurrentThreadId())
+        SleepConditionVariableCS(&watch->idle,&watch->lock,INFINITE);
+    idle = !watch->callback_thread;
+    LeaveCriticalSection(&watch->lock);
+    role_watch_release(watch);
+    return wait || idle;
+}
+
+void xgr_role_watch_close( enum xgr_role_watch_kind kind, void *owner )
+{
+    struct role_watch *watch;
+    XTaskQueueRegistrationToken token;
+    for (;;)
+    {
+        token.token = 0;
+        AcquireSRWLockShared(&role_watches_lock);
+        for (watch = role_watches; watch; watch = watch->next)
+            if (watch->kind == kind && watch->owner == owner) { token.token = watch->token; break; }
+        ReleaseSRWLockShared(&role_watches_lock);
+        if (!token.token) return;
+        xgr_role_watch_unregister(kind,owner,token,TRUE);
+    }
+}
+
 static HRESULT WINAPI x_user_XUserRegisterForChangeEvent( IXUserImpl6 *iface, XTaskQueueHandle queue, void *context, XUserChangeEventCallback *callback, XTaskQueueRegistrationToken *token )
 {
+    struct account_roles_params roles;
+
     TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
-    /* the single local user never changes; hand back a token that never fires */
+    if (account_roles_enabled())
+        return xgr_role_watch_register(XGR_ROLE_WATCH_USER,NULL,queue,context,callback,NULL,
+            !XGR_UNIX_CALL(account_roles,&roles) && roles.player_signed_in,token);
+    /* The legacy local user never changes. */
     if (token) token->token = 1;
     return S_OK;
 }
@@ -604,6 +786,7 @@ static HRESULT WINAPI x_user_XUserRegisterForChangeEvent( IXUserImpl6 *iface, XT
 static BOOLEAN WINAPI x_user_XUserUnregisterForChangeEvent( IXUserImpl6 *iface, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
     TRACE( "iface %p, wait %d.\n", iface, wait );
+    if (account_roles_enabled()) return xgr_role_watch_unregister(XGR_ROLE_WATCH_USER,NULL,token,wait);
     return TRUE;
 }
 
@@ -651,7 +834,11 @@ static HRESULT WINAPI x_user_XUserGetMsaTokenSilentlyResultSize( IXUserImpl6 *if
 
 static BOOLEAN WINAPI x_user_XUserIsStoreUser( IXUserImpl6 *iface, XUserHandle user )
 {
+    struct account_roles_params roles;
+
     TRACE( "iface %p, user %p.\n", iface, user );
+    if (account_roles_enabled())
+        return is_local_user(user) && !XGR_UNIX_CALL(account_roles,&roles) && roles.same_store_user;
     return is_local_user( user );  /* the local user owns the title from the store */
 }
 

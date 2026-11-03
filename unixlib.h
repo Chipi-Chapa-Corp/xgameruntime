@@ -78,11 +78,24 @@ struct store_catalog_params
     ULONG response_size;
 };
 
+struct account_roles_params
+{
+    UINT32 store_signed_in, player_signed_in, same_store_user;
+};
+
+struct store_entitlement_params
+{
+    char store_id[64];
+    UINT32 active;
+};
+
 enum xgr_funcs
 {
     unix_xsts_token,
     unix_license_token,
     unix_store_catalog,
+    unix_account_roles,
+    unix_store_entitlement,
     unix_funcs_count,
 };
 

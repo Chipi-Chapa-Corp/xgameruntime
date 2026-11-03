@@ -122,6 +122,7 @@ UINT64 xgr_local_xuid( void );
 /* Derived package family name (UTF-8, malloc'd) and install-root directory
  * (WCHAR, malloc'd), shared between XGameSave and XPackage. */
 char *xgr_package_family( void );
+const char *xgr_current_package_identifier( void );
 WCHAR *xgr_package_root( void );
 
 /* MicrosoftGame.config text (inline or from disk; UTF-8, malloc'd, or NULL). */
@@ -157,3 +158,10 @@ static inline BOOL xgr_async_completed( const XAsyncBlock *async, HRESULT *hr, v
     if (payload) *payload = async->internal[2];
     return TRUE;
 }
+
+/* Account-scoped change notifications (inactive in legacy runtime mode). */
+enum xgr_role_watch_kind { XGR_ROLE_WATCH_USER, XGR_ROLE_WATCH_GAME, XGR_ROLE_WATCH_PACKAGE };
+HRESULT xgr_role_watch_register(enum xgr_role_watch_kind, void *, XTaskQueueHandle, void *,
+    XUserChangeEventCallback *, XStoreGameLicenseChangedCallback *, BOOL, XTaskQueueRegistrationToken *);
+BOOLEAN xgr_role_watch_unregister(enum xgr_role_watch_kind, void *, XTaskQueueRegistrationToken, BOOLEAN);
+void xgr_role_watch_close(enum xgr_role_watch_kind, void *);

@@ -498,11 +498,65 @@ done:
     return status;
 }
 
+/* Ferestre account roles v1: fixed-size identity response, no profile IDs or
+ * credentials supplied by a title. The selected service owns both contexts. */
+static NTSTATUS account_roles( void *args )
+{
+    struct account_roles_params *params = args;
+    UINT32 request[2] = {0x58445341, 1}, response[4];
+    long long deadline = license_now_ms() + 5000;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    int fd;
+
+    memset( params, 0, sizeof(*params) );
+    if ((fd = connect_service()) < 0) return STATUS_NOT_FOUND;
+    fcntl( fd, F_SETFL, fcntl(fd,F_GETFL) | O_NONBLOCK );
+    errno = 0;
+    if (!license_io(fd,request,sizeof(request),TRUE,deadline) ||
+        !license_io(fd,response,sizeof(response),FALSE,deadline)) goto done;
+    if (response[0] != 1 || response[1] > 1 || response[2] > 1 || response[3] > 1) goto done;
+    params->store_signed_in = response[1];
+    params->player_signed_in = response[2];
+    params->same_store_user = response[1] && response[2] && response[3];
+    TRACE("Ferestre account roles v1: Store %u Player %u same %u\n",response[1],response[2],response[3]);
+    status = STATUS_SUCCESS;
+done:
+    close(fd);
+    return status;
+}
+
+static NTSTATUS store_entitlement( void *args )
+{
+    struct store_entitlement_params *params = args;
+    UINT32 request[3] = {0x58445345,1,12}, response[2];
+    long long deadline = license_now_ms() + 30000;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    int fd;
+
+    params->active = 0;
+    if (strnlen(params->store_id,sizeof(params->store_id)) != 12) return STATUS_INVALID_PARAMETER;
+    if ((fd = connect_service()) < 0) return STATUS_NOT_FOUND;
+    fcntl( fd,F_SETFL,fcntl(fd,F_GETFL) | O_NONBLOCK );
+    errno = 0;
+    if (!license_io(fd,request,sizeof(request),TRUE,deadline) ||
+        !license_io(fd,params->store_id,12,TRUE,deadline) ||
+        !license_io(fd,response,sizeof(response),FALSE,deadline)) goto done;
+    if (response[0] != 1 || response[1] > 1) goto done;
+    params->active = response[1];
+    status = STATUS_SUCCESS;
+done:
+    if (status && errno == ETIMEDOUT) status = STATUS_IO_TIMEOUT;
+    close(fd);
+    return status;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     xsts_token,
     license_token,
     store_catalog,
+    account_roles,
+    store_entitlement,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );

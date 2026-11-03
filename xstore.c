@@ -43,6 +43,7 @@ struct x_store_context
 struct x_store_license
 {
     BOOL valid;
+    BOOL verified;
 };
 
 /* Legacy current-game data and opt-in immutable catalog snapshots share the
@@ -84,6 +85,15 @@ static void store_sku_id( char *out, SIZE_T cap )
         snprintf( out, cap, "%s", "0000000000000000" );
 }
 
+enum store_role_kind { ROLE_QUERY, ROLE_GAME_LICENSE, ROLE_ACQUIRE, ROLE_CAN_ACQUIRE };
+static HRESULT role_store_begin( XAsyncBlock *async, enum store_role_kind kind );
+
+static BOOL account_roles_enabled(void)
+{
+    char enabled[8];
+    return GetEnvironmentVariableA("XGR_ACCOUNT_ROLES_V1",enabled,sizeof(enabled)) && !strcmp(enabled,"1");
+}
+
 /* Hand back a fresh product-query handle via an async block.
  *
  * `with_current` decides whether enumerating it reports the running game. A
@@ -97,6 +107,7 @@ static HRESULT complete_query( XAsyncBlock *async, BOOL with_current )
     struct x_store_product_query *q;
 
     if (!async) return E_INVALIDARG;
+    if (with_current && account_roles_enabled()) return role_store_begin(async,ROLE_QUERY);
     if (!(q = calloc( 1, sizeof(*q) )))
     {
         xgr_async_complete( async, E_OUTOFMEMORY, NULL );
@@ -332,6 +343,125 @@ invalid:
     catalog_operation_free(op); return E_INVALIDARG;
 }
 
+/* In profile mode every ownership result comes from the Store account's
+ * authenticated content licence, and the slow request runs on the XAsync work
+ * queue. The legacy running-title fallback stays outside this mode. */
+static const char role_game_license_identity, role_acquire_identity, role_can_acquire_identity;
+struct role_store_operation
+{
+    enum store_role_kind kind;
+    struct store_entitlement_params ipc;
+    union
+    {
+        struct x_store_product_query *query;
+        struct x_store_license *license;
+        XStoreGameLicense game;
+        XStoreCanAcquireLicenseResult can;
+    } result;
+};
+
+static void role_store_free( struct role_store_operation *op )
+{
+    if (op->kind == ROLE_QUERY) free(op->result.query);
+    if (op->kind == ROLE_ACQUIRE) free(op->result.license);
+    free(op);
+}
+
+static HRESULT CALLBACK role_store_provider( XAsyncOp operation, const XAsyncProviderData *data )
+{
+    struct role_store_operation *op = data->context;
+    NTSTATUS status;
+    SIZE_T size = 0;
+    HRESULT hr;
+    FILETIME time;
+    ULONGLONG seconds;
+
+    switch (operation)
+    {
+    case XAsyncOp_Begin:
+        return IXThreadingImpl_XAsyncSchedule(x_threading_impl,data->async,0);
+    case XAsyncOp_DoWork:
+        status = XGR_UNIX_CALL(store_entitlement,&op->ipc);
+        hr = status == STATUS_IO_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : status ? E_FAIL : S_OK;
+        if (SUCCEEDED(hr)) switch (op->kind)
+        {
+        case ROLE_QUERY:
+            if (!(op->result.query = calloc(1,sizeof(*op->result.query)))) { hr = E_OUTOFMEMORY; break; }
+            op->result.query->has_current = op->ipc.active;
+            if (op->ipc.active) init_current_product(op->result.query);
+            size = sizeof(op->result.query);
+            break;
+        case ROLE_GAME_LICENSE:
+            op->result.game.isActive = op->ipc.active;
+            store_sku_id(op->result.game.skuStoreId,sizeof(op->result.game.skuStoreId));
+            GetSystemTimeAsFileTime(&time);
+            seconds = (((ULONGLONG)time.dwHighDateTime << 32) | time.dwLowDateTime) / 10000000 - 11644473600ULL;
+            op->result.game.expirationDate = seconds + 60;
+            size = sizeof(op->result.game);
+            break;
+        case ROLE_ACQUIRE:
+            if (!op->ipc.active) { hr = HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED); break; }
+            if (!(op->result.license = calloc(1,sizeof(*op->result.license)))) { hr = E_OUTOFMEMORY; break; }
+            op->result.license->valid = TRUE;
+            op->result.license->verified = TRUE;
+            size = sizeof(op->result.license);
+            break;
+        case ROLE_CAN_ACQUIRE:
+            op->result.can.status = op->ipc.active ? XStoreCanLicenseStatus_Licensable : XStoreCanLicenseStatus_NotLicensableToUser;
+            size = sizeof(op->result.can);
+            break;
+        }
+        IXThreadingImpl_XAsyncComplete(x_threading_impl,data->async,hr,SUCCEEDED(hr) ? size : 0);
+        return E_PENDING;
+    case XAsyncOp_GetResult:
+        switch (op->kind)
+        {
+        case ROLE_QUERY:
+            memcpy(data->buffer,&op->result.query,sizeof(op->result.query)); op->result.query = NULL; break;
+        case ROLE_GAME_LICENSE:
+            memcpy(data->buffer,&op->result.game,sizeof(op->result.game)); break;
+        case ROLE_ACQUIRE:
+            memcpy(data->buffer,&op->result.license,sizeof(op->result.license)); op->result.license = NULL; break;
+        case ROLE_CAN_ACQUIRE:
+            memcpy(data->buffer,&op->result.can,sizeof(op->result.can)); break;
+        }
+        return S_OK;
+    case XAsyncOp_Cleanup:
+        role_store_free(op); return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
+static HRESULT role_store_begin( XAsyncBlock *async, enum store_role_kind kind )
+{
+    struct role_store_operation *op;
+    const void *identity;
+    HRESULT hr;
+
+    if (!async) return E_INVALIDARG;
+    if (!(op = calloc(1,sizeof(*op)))) return E_OUTOFMEMORY;
+    op->kind = kind;
+    if (!xgr_config_element("StoreId",op->ipc.store_id,sizeof(op->ipc.store_id)))
+    { free(op); return E_INVALIDARG; }
+    switch (kind)
+    {
+    case ROLE_QUERY: identity = &store_catalog_identity; break;
+    case ROLE_GAME_LICENSE: identity = &role_game_license_identity; break;
+    case ROLE_ACQUIRE: identity = &role_acquire_identity; break;
+    default: identity = &role_can_acquire_identity; break;
+    }
+    hr = IXThreadingImpl_XAsyncBegin(x_threading_impl,async,op,identity,"StoreAccountLicense",role_store_provider);
+    if (FAILED(hr)) role_store_free(op);
+    return hr;
+}
+
+static BOOL current_package( const char *package )
+{
+    const char *current = xgr_current_package_identifier();
+    return package && current && !strcmp(package,current);
+}
+
 static HRESULT query_result( XAsyncBlock *async, XStoreProductQueryHandle *out )
 {
     void *payload;
@@ -411,6 +541,7 @@ static HRESULT WINAPI x_store_XStoreCreateContext( IXStoreImpl6 *iface, const XU
 static void WINAPI x_store_XStoreCloseContextHandle( IXStoreImpl6 *iface, XStoreContextHandle storeContextHandle )
 {
     TRACE( "iface %p, storeContextHandle %p.\n", iface, storeContextHandle );
+    xgr_role_watch_close(XGR_ROLE_WATCH_GAME,storeContextHandle);
     free( storeContextHandle );
 }
 
@@ -555,6 +686,11 @@ static HRESULT WINAPI x_store_XStoreAcquireLicenseForPackageAsync( IXStoreImpl6 
     struct x_store_license *lic;
 
     TRACE( "iface %p, productQueryHandle %p, packageIdentifier %s, async %p.\n", iface, productQueryHandle, debugstr_a( packageIdentifier ), async );
+    if (account_roles_enabled())
+    {
+        if (!current_package(packageIdentifier)) return E_NOTIMPL;
+        return role_store_begin(async,ROLE_ACQUIRE);
+    }
     if (!async) return E_INVALIDARG;
     if (!(lic = calloc( 1, sizeof(*lic) )))
     {
@@ -573,6 +709,8 @@ static HRESULT WINAPI x_store_XStoreAcquireLicenseForPackageResult( IXStoreImpl6
 
     TRACE( "iface %p, async %p, storeLicenseHandle %p.\n", iface, async, storeLicenseHandle );
     if (!storeLicenseHandle) return E_INVALIDARG;
+    if (account_roles_enabled()) return IXThreadingImpl_XAsyncGetResult(x_threading_impl,async,
+        &role_acquire_identity,sizeof(*storeLicenseHandle),storeLicenseHandle,NULL);
     if (!xgr_async_completed( async, &hr, &payload )) return E_PENDING;
     *storeLicenseHandle = SUCCEEDED( hr ) ? payload : NULL;
     return hr;
@@ -581,14 +719,22 @@ static HRESULT WINAPI x_store_XStoreAcquireLicenseForPackageResult( IXStoreImpl6
 static BOOLEAN WINAPI x_store_XStoreIsLicenseValid( IXStoreImpl6 *iface, const XStoreLicenseHandle storeLicenseHandle )
 {
     struct x_store_license *lic = storeLicenseHandle;
+    struct store_entitlement_params entitlement = {{0}};
 
     TRACE( "iface %p, storeLicenseHandle %p.\n", iface, storeLicenseHandle );
+    if (lic && lic->verified)
+    {
+        if (!xgr_config_element("StoreId",entitlement.store_id,sizeof(entitlement.store_id)) ||
+            XGR_UNIX_CALL(store_entitlement,&entitlement) || !entitlement.active) lic->valid = FALSE;
+        return lic->valid;
+    }
     return lic && lic->valid;
 }
 
 static void WINAPI x_store_XStoreCloseLicenseHandle( IXStoreImpl6 *iface, XStoreLicenseHandle storeLicenseHandle )
 {
     TRACE( "iface %p, storeLicenseHandle %p.\n", iface, storeLicenseHandle );
+    xgr_role_watch_close(XGR_ROLE_WATCH_PACKAGE,storeLicenseHandle);
     free( storeLicenseHandle );
 }
 
@@ -607,6 +753,11 @@ static HRESULT WINAPI x_store_XStoreCanAcquireLicenseForStoreIdResult( IXStoreIm
 static HRESULT WINAPI x_store_XStoreCanAcquireLicenseForPackageAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char *packageIdentifier, XAsyncBlock *async )
 {
     TRACE( "iface %p, storeContextHandle %p, packageIdentifier %s, async %p.\n", iface, storeContextHandle, debugstr_a( packageIdentifier ), async );
+    if (account_roles_enabled())
+    {
+        if (!current_package(packageIdentifier)) return E_NOTIMPL;
+        return role_store_begin(async,ROLE_CAN_ACQUIRE);
+    }
     if (!async) return E_INVALIDARG;
     xgr_async_complete( async, S_OK, NULL );
     return S_OK;
@@ -618,6 +769,8 @@ static HRESULT WINAPI x_store_XStoreCanAcquireLicenseForPackageResult( IXStoreIm
 
     TRACE( "iface %p, async %p, storeCanAcquireLicense %p.\n", iface, async, storeCanAcquireLicense );
     if (!storeCanAcquireLicense) return E_INVALIDARG;
+    if (account_roles_enabled()) return IXThreadingImpl_XAsyncGetResult(x_threading_impl,async,
+        &role_can_acquire_identity,sizeof(*storeCanAcquireLicense),storeCanAcquireLicense,NULL);
     if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
     memset( storeCanAcquireLicense, 0, sizeof(*storeCanAcquireLicense) );
     storeCanAcquireLicense->status = XStoreCanLicenseStatus_Licensable;
@@ -627,6 +780,10 @@ static HRESULT WINAPI x_store_XStoreCanAcquireLicenseForPackageResult( IXStoreIm
 static HRESULT WINAPI x_store_XStoreQueryGameLicenseAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, XAsyncBlock *async )
 {
     TRACE( "iface %p, storeContextHandle %p, async %p.\n", iface, storeContextHandle, async );
+    if (account_roles_enabled())
+    {
+        return role_store_begin(async,ROLE_GAME_LICENSE);
+    }
     if (!async) return E_INVALIDARG;
     xgr_async_complete( async, S_OK, NULL );
     return S_OK;
@@ -639,6 +796,8 @@ static HRESULT WINAPI x_store_XStoreQueryGameLicenseResult( IXStoreImpl6 *iface,
     TRACE( "iface %p, async %p, license %p.\n", iface, async, license );
 
     if (!license) return E_INVALIDARG;
+    if (account_roles_enabled()) return IXThreadingImpl_XAsyncGetResult(x_threading_impl,async,
+        &role_game_license_identity,sizeof(*license),license,NULL);
     if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
     if (FAILED( hr )) return hr;
     memset( license, 0, sizeof(*license) );
@@ -988,8 +1147,16 @@ static HRESULT WINAPI x_store_XStoreQueryPackageIdentifier( IXStoreImpl6 *iface,
 
 static HRESULT WINAPI x_store_XStoreRegisterGameLicenseChanged( IXStoreImpl6 *iface, XStoreContextHandle storeContextHandle, XTaskQueueHandle queue, void *context, XStoreGameLicenseChangedCallback *callback, XTaskQueueRegistrationToken *token )
 {
+    struct store_entitlement_params entitlement = {{0}};
+
     TRACE( "iface %p, storeContextHandle %p, queue %p, context %p, callback %p, token %p.\n", iface, storeContextHandle, queue, context, callback, token );
-    /* the licence never changes offline, so no callback is scheduled */
+    if (account_roles_enabled())
+    {
+        if (!storeContextHandle || !xgr_config_element("StoreId",entitlement.store_id,sizeof(entitlement.store_id))) return E_INVALIDARG;
+        return xgr_role_watch_register(XGR_ROLE_WATCH_GAME,storeContextHandle,queue,context,NULL,callback,
+            !XGR_UNIX_CALL(store_entitlement,&entitlement) && entitlement.active,token);
+    }
+    /* Legacy mode has no live Store state. */
     if (token) token->token = 1;
     return S_OK;
 }
@@ -997,13 +1164,20 @@ static HRESULT WINAPI x_store_XStoreRegisterGameLicenseChanged( IXStoreImpl6 *if
 static BOOLEAN WINAPI x_store_XStoreUnregisterGameLicenseChanged( IXStoreImpl6 *iface, XStoreContextHandle storeContextHandle, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
     TRACE( "iface %p, storeContextHandle %p, wait %d.\n", iface, storeContextHandle, wait );
+    if (account_roles_enabled()) return xgr_role_watch_unregister(XGR_ROLE_WATCH_GAME,storeContextHandle,token,wait);
     return TRUE;
 }
 
 static HRESULT WINAPI x_store_XStoreRegisterPackageLicenseLost( IXStoreImpl6 *iface, XStoreLicenseHandle storeLicenseHandle, XTaskQueueHandle queue, void *context, XStorePackageLicenseLostCallback *callback, XTaskQueueRegistrationToken *token)
 {
     TRACE( "iface %p, storeLicenseHandle %p, queue %p, context %p, callback %p, token %p.\n", iface, storeLicenseHandle, queue, context, callback, token );
-    /* the licence is never lost offline */
+    if (account_roles_enabled())
+    {
+        struct x_store_license *license = storeLicenseHandle;
+        if (!license || !license->verified) return E_INVALIDARG;
+        return xgr_role_watch_register(XGR_ROLE_WATCH_PACKAGE,storeLicenseHandle,queue,context,NULL,callback,license->valid,token);
+    }
+    /* Legacy mode has no live Store state. */
     if (token) token->token = 1;
     return S_OK;
 }
@@ -1011,6 +1185,7 @@ static HRESULT WINAPI x_store_XStoreRegisterPackageLicenseLost( IXStoreImpl6 *if
 static BOOLEAN WINAPI x_store_XStoreUnregisterPackageLicenseLost( IXStoreImpl6 *iface, XStoreLicenseHandle licenseHandle, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
     TRACE( "iface %p, licenseHandle %p, wait %d.\n", iface, licenseHandle, wait );
+    if (account_roles_enabled()) return xgr_role_watch_unregister(XGR_ROLE_WATCH_PACKAGE,licenseHandle,token,wait);
     return TRUE;
 }
 
