@@ -1,9 +1,10 @@
 MODULE    = xgameruntime.dll
 UNIXLIB   = xgameruntime.so
-IMPORTS   = combase bcrypt
+IMPORTS   = combase bcrypt advapi32 user32
 
 SOURCES = \
 	main.c \
+	pfxgamesave.c \
 	unixlib.c \
 	xaccessibility.c \
 	xaccessibility.idl \

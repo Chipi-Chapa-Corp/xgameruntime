@@ -121,10 +121,17 @@ static char *base64_encode( const void *data, size_t len )
     return out;
 }
 
+/* Isolate a candidate service without changing desktop/audio discovery. */
+static const char *xodus_runtime_dir(void)
+{
+    const char *override = getenv("XODUS_RUNTIME_DIR");
+    return override && *override ? override : getenv("XDG_RUNTIME_DIR");
+}
+
 static int connect_service( void )
 {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    const char *runtime_dir = getenv( "XDG_RUNTIME_DIR" );
+    const char *runtime_dir = xodus_runtime_dir();
     int fd;
 
     if (!runtime_dir || !runtime_dir[0])
@@ -214,6 +221,7 @@ static NTSTATUS xsts_token_once( void *args )
 {
     struct xsts_token_params *params = args;
     char *request = NULL, header[8], *body = NULL, *body_b64 = NULL;
+    unsigned int extended_size;
     char *url_esc = NULL, *method_esc = NULL, *title_esc = NULL, *client_esc = NULL;
     unsigned int magic, size;
     unsigned short type, len;
@@ -229,6 +237,8 @@ static NTSTATUS xsts_token_once( void *args )
 
     /* The signature covers the body, so it has to travel with the ask; base64
      * keeps arbitrary bytes safe inside the XML. */
+    if (params->body_size > 6 * 1024 * 1024)
+    { status = STATUS_INVALID_BUFFER_SIZE; goto done; }
     if (params->body && params->body_size)
     {
         if (!(body_b64 = base64_encode( params->body, params->body_size ))) goto done;
@@ -257,27 +267,26 @@ static NTSTATUS xsts_token_once( void *args )
                          url_esc, method_esc, title_esc, client_esc,
                          body_b64 ? body_b64 : "" );
     if (body_len < 0 || body_len >= (int)request_size) goto done;
-    if (body_len > 0xffff)
-    {
-        WARN( "request body is too large to frame.\n" );
-        goto done;
-    }
+    if (body_len > 8 * 1024 * 1024)
+    { status = STATUS_INVALID_BUFFER_SIZE; goto done; }
 
     magic = XODUS_XML_MAGIC;
-    type = XODUS_XSTS_TOKEN_REQUEST;
-    len = body_len;
+    type = XODUS_XSTS_TOKEN_REQUEST | (body_len > 0xffff ? 0x8000 : 0);
+    len = body_len > 0xffff ? 0xffff : body_len;
     memcpy( header, &magic, 4 );
     memcpy( header + 4, &type, 2 );
     memcpy( header + 6, &len, 2 );
 
     if (!write_all( fd, header, sizeof(header) )) goto done;
+    extended_size = body_len;
+    if (body_len > 0xffff && !write_all( fd, &extended_size, sizeof(extended_size) )) goto done;
     if (!write_all( fd, request, body_len )) goto done;
 
     if (!read_all( fd, header, sizeof(header) )) goto done;
     memcpy( &magic, header, 4 );
     memcpy( &type, header + 4, 2 );
     memcpy( &len, header + 6, 2 );
-    if (magic != XODUS_XML_MAGIC)
+    if (magic != XODUS_XML_MAGIC || type != XODUS_XSTS_TOKEN_REQUEST + 1)
     {
         WARN( "unexpected reply magic %#x.\n", magic );
         goto done;
@@ -386,7 +395,7 @@ static BOOL license_io( int fd, void *buffer, SIZE_T size, BOOL writing, long lo
 static NTSTATUS license_token( void *args )
 {
     struct license_token_params *params = args;
-    const char *runtime_dir = getenv( "XDG_RUNTIME_DIR" );
+    const char *runtime_dir = xodus_runtime_dir();
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     char *custom = NULL, *request = NULL, *parent = NULL, *title = NULL, *client = NULL, *id;
     unsigned char header[8];

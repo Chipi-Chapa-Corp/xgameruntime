@@ -39,6 +39,7 @@
  */
 
 #include "private.h"
+#include "pfxgamesave.h"
 
 #include <objbase.h>
 #include <bcrypt.h>
@@ -2194,108 +2195,91 @@ static HRESULT WINAPI x_game_save_XGameSaveFilesGetRemainingQuota( IXGameSaveImp
     return S_OK;
 }
 
-/* The PlayFab half of IXGameSaveImpl4. Each method fails with E_NOTIMPL rather
- * than reporting success, so a title never believes a cloud save happened. */
+/* The PlayFab half delegates to its separate authenticated synchronization
+ * backend; legacy WGS behavior and interface slots remain unchanged. */
 static HRESULT WINAPI x_game_save_PFXGameSaveInitializeConfig( IXGameSaveImpl4 *iface, struct PFXGameSaveConfigRequest *request, PFXGameSaveConfigHandle *config )
 {
-    FIXME( "PFXGameSaveInitializeConfig: PlayFab cloud saves are unsupported.\n" );
-    if (config) *config = NULL;
-    return E_NOTIMPL;
+    return pfx_config_create(request, config);
 }
 
 static void WINAPI x_game_save_PFXGameSaveFreeConfig( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config )
 {
-    FIXME( "PFXGameSaveFreeConfig: PlayFab cloud saves are unsupported.\n" );
+    pfx_config_close(config);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveFilesGetFolderWithUiAsync( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, XAsyncBlock *async )
 {
-    FIXME( "PFXGameSaveFilesGetFolderWithUiAsync: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_folder_async(config, async);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveFilesGetFolderWithUiResult( IXGameSaveImpl4 *iface, XAsyncBlock *async, SIZE_T folderSize, char *folderResult )
 {
-    FIXME( "PFXGameSaveFilesGetFolderWithUiResult: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_folder_result(async, folderSize, folderResult);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveFilesGetRemainingQuota( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, INT64 *remainingQuota )
 {
-    FIXME( "PFXGameSaveFilesGetRemainingQuota: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_remaining_quota(config, remainingQuota);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveSetUiCallbacks( IXGameSaveImpl4 *iface, struct PFXGameSaveUiCallbacks *callbacks )
 {
-    FIXME( "PFXGameSaveSetUiCallbacks: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_set_ui(callbacks);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveProgressUiGetProgress( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 *syncState, UINT64 *current, UINT64 *total )
 {
-    FIXME( "PFXGameSaveProgressUiGetProgress: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_progress(user, syncState, current, total);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveSetProgressUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
 {
-    FIXME( "PFXGameSaveSetProgressUiResponse: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_ui_response(user, 0, response);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveSetSyncFailedUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
 {
-    FIXME( "PFXGameSaveSetSyncFailedUiResponse: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_ui_response(user, 1, response);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveSetActiveDeviceContentionUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
 {
-    FIXME( "PFXGameSaveSetActiveDeviceContentionUiResponse: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_ui_response(user, 2, response);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveSetConflictUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
 {
-    FIXME( "PFXGameSaveSetConflictUiResponse: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_ui_response(user, 3, response);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveSetOutOfStorageUiResponse( IXGameSaveImpl4 *iface, XUserHandle user, UINT32 response )
 {
-    FIXME( "PFXGameSaveSetOutOfStorageUiResponse: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_ui_response(user, 4, response);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveFilesUploadWithUiAsync( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, UINT32 options, XAsyncBlock *async )
 {
-    FIXME( "PFXGameSaveFilesUploadWithUiAsync: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_upload_async(config, options, async);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveFilesUploadWithUiResult( IXGameSaveImpl4 *iface, XAsyncBlock *async )
 {
-    FIXME( "PFXGameSaveFilesUploadWithUiResult: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_status_result(async);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveFilesSetSaveDescriptionAsync( IXGameSaveImpl4 *iface, PFXGameSaveConfigHandle config, const char *description, XAsyncBlock *async )
 {
-    FIXME( "PFXGameSaveFilesSetSaveDescriptionAsync: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_description_async(config, description, async);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveFilesSetSaveDescriptionResult( IXGameSaveImpl4 *iface, XAsyncBlock *async )
 {
-    FIXME( "PFXGameSaveFilesSetSaveDescriptionResult: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_status_result(async);
 }
 
 static HRESULT WINAPI x_game_save_PFXGameSaveSetActiveDeviceChangedCallback( IXGameSaveImpl4 *iface, void *callback, void *context )
 {
-    FIXME( "PFXGameSaveSetActiveDeviceChangedCallback: PlayFab cloud saves are unsupported.\n" );
-    return E_NOTIMPL;
+    return pfx_set_device_callback(callback, context);
 }
 
 static const struct IXGameSaveImpl4Vtbl x_game_save_vtbl =

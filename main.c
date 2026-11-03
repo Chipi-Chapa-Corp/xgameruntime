@@ -21,8 +21,71 @@
 #include <initguid.h>
 #include "private.h"
 #include "unixlib.h"
+#include <rtlsupportapi.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(xgameruntime);
+WINE_DECLARE_DEBUG_CHANNEL(hctrace);
+WINE_DECLARE_DEBUG_CHANNEL(xgrfault);
+
+/* Opt-in read-only exception diagnostics. Games may deliberately raise a
+ * large number of handled illegal-instruction exceptions; tracing all SEH
+ * activity changes timing substantially. Capture only memory faults here. */
+static PVOID fault_trace_handler;
+
+static LONG CALLBACK trace_memory_fault(EXCEPTION_POINTERS *exception)
+{
+#ifdef __x86_64__
+    static LONG tracing, count;
+    CONTEXT context = *exception->ContextRecord;
+    ULONG_PTR frames[24], instruction[4];
+    SIZE_T read;
+    ULONG_PTR image_base;
+    PRUNTIME_FUNCTION function;
+    PVOID handler_data;
+    ULONG_PTR establisher;
+    unsigned int i, n = 0;
+    if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        InterlockedCompareExchange(&tracing, 1, 0)) return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&count) <= 64)
+    {
+        TRACE_(xgrfault)("memory fault rip=%s rsp=%s rax=%s rbx=%s rcx=%s rdx=%s rsi=%s rdi=%s.\n",
+                        wine_dbgstr_longlong(context.Rip), wine_dbgstr_longlong(context.Rsp),
+                        wine_dbgstr_longlong(context.Rax), wine_dbgstr_longlong(context.Rbx),
+                        wine_dbgstr_longlong(context.Rcx), wine_dbgstr_longlong(context.Rdx),
+                        wine_dbgstr_longlong(context.Rsi), wine_dbgstr_longlong(context.Rdi));
+        if (ReadProcessMemory(GetCurrentProcess(), (void *)context.Rip, instruction, sizeof(instruction), &read))
+            for (i = 0; i < ARRAY_SIZE(instruction); i++)
+                TRACE_(xgrfault)("fault instruction word %u: %s.\n", i, wine_dbgstr_longlong(instruction[i]));
+        while (context.Rip && n < ARRAY_SIZE(frames))
+        {
+            frames[n++] = context.Rip;
+            function = RtlLookupFunctionEntry(context.Rip, &image_base, NULL);
+            if (function)
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function,
+                                 &context, &handler_data, &establisher, NULL);
+            else
+            {
+                if (!ReadProcessMemory(GetCurrentProcess(), (void *)context.Rsp, &context.Rip, sizeof(context.Rip), &read)) break;
+                context.Rsp += sizeof(context.Rip);
+            }
+        }
+        for (i = 0; i < n; i++) TRACE_(xgrfault)("frame %u: %s.\n", i, wine_dbgstr_longlong(frames[i]));
+    }
+    InterlockedExchange(&tracing, 0);
+#endif
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void enable_fault_trace(void)
+{
+    static LONG enabled;
+    if (getenv("XGR_TRACE_FAULTS") && !InterlockedCompareExchange(&enabled, 1, 0))
+    {
+        fault_trace_handler = AddVectoredExceptionHandler(1, trace_memory_fault);
+        TRACE_(xgrfault)("fault observer registered: %p.\n", fault_trace_handler);
+        if (!fault_trace_handler) InterlockedExchange(&enabled, 0);
+    }
+}
 
 DWORD tlsIndex;
 
@@ -43,6 +106,7 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
             TlsSetValue( tlsIndex, FALSE );
             break;
         case DLL_PROCESS_DETACH:
+            if (fault_trace_handler) RemoveVectoredExceptionHandler(fault_trace_handler);
             TlsFree( tlsIndex );
             break;
     }
@@ -72,7 +136,7 @@ char *xgr_game_config;
 static void CALLBACK hc_trace_callback( const char *area, UINT32 level, UINT64 thread,
                                         UINT64 timestamp, const char *message )
 {
-    TRACE( "libhttpclient: %s\n", debugstr_a( message ) );
+    TRACE_(hctrace)( "libhttpclient: %s\n", debugstr_a( message ) );
 }
 
 static DWORD WINAPI hc_trace_thread( void *arg )
@@ -84,7 +148,9 @@ static DWORD WINAPI hc_trace_thread( void *arg )
 
     for (i = 0; i < 1200 && !mod; i++)
     {
-        if (!(mod = GetModuleHandleA( "libHttpClient.GDK.dll" ))) Sleep( 100 );
+        mod = GetModuleHandleA( "libHttpClient.GDK.dll" );
+        if (!mod) mod = GetModuleHandleA( "libHttpClient.dll" );
+        if (!mod) Sleep( 100 );
     }
     if (!mod) { WARN( "libHttpClient never loaded; no trace.\n" ); return 0; }
 
@@ -94,7 +160,7 @@ static DWORD WINAPI hc_trace_thread( void *arg )
 
     set_callback( hc_trace_callback );
     set_level( 5 );   /* Verbose */
-    TRACE( "libHttpClient tracing enabled.\n" );
+    TRACE_(hctrace)( "libHttpClient tracing enabled.\n" );
     return 0;
 }
 
@@ -113,10 +179,51 @@ static void enable_hc_trace_once(void)
     InitOnceComplete( &once, 0, NULL );
 }
 
-HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, char mode, const struct initialize_options *options )
+/* XSystemGetRuntimeInfo is implemented in the statically linked GDK client.
+ * On desktop it reads these REG_QWORD values directly, including before API
+ * initialization. Their layout is package-version order (major in the high
+ * word), not XVersion's in-memory word order. Without registration the SDK
+ * reports zero, and Forza Horizon 6 refuses Start Game before it can exercise
+ * any other compatibility behavior. This is the Gaming Services package contract version (35.112.20003.0),
+ * distinct from the 10.0.x GDK/DLL interface versions passed to initialization;
+ * it does not assert that every API or title has been qualified. */
+HRESULT WINAPI DllRegisterServer( void )
 {
+    static const WCHAR key_name[] = L"Software\\Microsoft\\GamingServices";
+    const UINT64 version = ((UINT64)35 << 48) | ((UINT64)112 << 32) | ((UINT64)20003 << 16);
+    HKEY key;
+    LONG status;
+
+    if ((status = RegCreateKeyExW( HKEY_LOCAL_MACHINE, key_name, 0, NULL, 0,
+                                  KEY_SET_VALUE, NULL, &key, NULL )))
+        return HRESULT_FROM_WIN32( status );
+    status = RegSetValueExW( key, L"CurrentVersion", 0, REG_QWORD,
+                            (const BYTE *)&version, sizeof(version) );
+    if (!status)
+        status = RegSetValueExW( key, L"AvailableVersion", 0, REG_QWORD,
+                                (const BYTE *)&version, sizeof(version) );
+    RegCloseKey( key );
+    /* Advertise the PFX facade only to a title that has the matching native
+     * save backend loaded. Legacy titles keep their previous discovery path. */
+    if (!status && GetModuleHandleW(L"PlayFabGameSave.dll") && GetModuleHandleW(L"PlayFabCore.dll"))
+    {
+        status = RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+                L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\OneSettings\\xbox\\GamingRuntimeServices\\Settings",
+                0, NULL, 0, KEY_QUERY_VALUE, NULL, &key, NULL);
+        if (!status) RegCloseKey(key);
+    }
+    return status ? HRESULT_FROM_WIN32( status ) : S_OK;
+}
+
+HRESULT WINAPI InitializeApiImplEx2( UINT64 gdkVer, UINT64 gsVer, char mode, const struct initialize_options *options )
+{
+    HRESULT registration;
     enable_hc_trace_once();
-    TRACE( "gdkVer %ld, gsVer %ld, mode %d, options %p.\n", gdkVer, gsVer, mode, options );
+    enable_fault_trace();
+    TRACE( "gdkVer %s, gsVer %s, mode %d, options %p.\n",
+           wine_dbgstr_longlong(gdkVer), wine_dbgstr_longlong(gsVer), mode, options );
+    if (FAILED(registration = DllRegisterServer()))
+        WARN( "runtime discovery registration failed, hr %#lx.\n", registration );
 
     if (options)
     {
@@ -130,12 +237,12 @@ HRESULT WINAPI InitializeApiImplEx2( ULONG gdkVer, ULONG gsVer, char mode, const
     return S_OK;
 }
 
-HRESULT WINAPI InitializeApiImplEx( ULONG gdkVer, ULONG gsVer, char mode )
+HRESULT WINAPI InitializeApiImplEx( UINT64 gdkVer, UINT64 gsVer, char mode )
 {
     return InitializeApiImplEx2( gdkVer, gsVer, mode, NULL );
 }
 
-HRESULT WINAPI InitializeApiImpl( ULONG gdkVer, ULONG gsVer )
+HRESULT WINAPI InitializeApiImpl( UINT64 gdkVer, UINT64 gsVer )
 {
     return InitializeApiImplEx2( gdkVer, gsVer, 0, NULL );
 }

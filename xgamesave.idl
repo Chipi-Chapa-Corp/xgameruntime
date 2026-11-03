@@ -121,12 +121,57 @@ interface IXGameSaveImpl3 : IXGameSaveImpl2
 /* IXGameSaveImpl4 appends the PFXGameSave methods. Slot numbers follow the
  * Microsoft.GDK.PC 2510.3.6286 XGameSave/PFXGameSave headers: the methods
  * inherited from IXGameSaveImpl3 keep slots 3-32, and the seventeen PFXGameSave
- * methods take slots 33-49. A title may ask for this revision before its legacy
- * save calls, so the complete layout is exposed even though PlayFab cloud
- * storage itself is unsupported. */
+ * methods take slots 33-49. Legacy calls retain their WGS implementation;
+ * PFX calls use the separate PlayFab save backend. */
 typedef struct PFXGameSaveConfig *PFXGameSaveConfigHandle;
-struct PFXGameSaveConfigRequest;
-struct PFXGameSaveUiCallbacks;
+struct PFXGameSaveConfigRequest
+{
+    XUserHandle requestingUser;
+    const char *titleId;
+    const char *apiUrl;
+    UINT32 flags;
+    const char *entityId;
+    const char *entityToken;
+    const char *fileLocation;
+};
+
+struct PFXGameSaveDescriptor
+{
+    const char *deviceType;
+    const char *deviceId;
+    const char *friendlyName;
+    const char *thumbnailUri;
+    const char *shortSaveDescription;
+    INT64 time;
+    UINT64 totalBytes;
+    UINT64 uploadedBytes;
+};
+
+typedef void __stdcall PFXGameSaveProgressUiCallback( XUserHandle user, UINT32 state, void *context );
+typedef void __stdcall PFXGameSaveSyncFailedUiCallback( XUserHandle user, UINT32 state, HRESULT error, void *context );
+typedef void __stdcall PFXGameSaveContentionUiCallback( XUserHandle user, INT64 localTime, INT64 remoteTime, void *context );
+typedef void __stdcall PFXGameSaveConflictUiCallback( XUserHandle user, INT64 localTime, INT64 remoteTime, UINT64 localSize, UINT64 remoteSize, void *context );
+typedef void __stdcall PFXGameSaveStorageUiCallback( XUserHandle user, BOOLEAN userPartition, UINT64 requiredBytes, void *context );
+typedef void __stdcall PFXGameSaveDescriptorUiCallback( XUserHandle user, struct PFXGameSaveDescriptor *local, struct PFXGameSaveDescriptor *remote, void *context );
+typedef void __stdcall PFXGameSaveDeviceChangedCallback( XUserHandle user, struct PFXGameSaveDescriptor *device, void *context );
+
+struct PFXGameSaveUiCallbacks
+{
+    PFXGameSaveProgressUiCallback *progressCallback;
+    void *progressContext;
+    PFXGameSaveSyncFailedUiCallback *syncFailedCallback;
+    void *syncFailedContext;
+    PFXGameSaveContentionUiCallback *activeDeviceContentionCallback;
+    void *activeDeviceContentionContext;
+    PFXGameSaveConflictUiCallback *conflictCallback;
+    void *conflictContext;
+    PFXGameSaveStorageUiCallback *outOfStorageCallback;
+    void *outOfStorageContext;
+    PFXGameSaveDescriptorUiCallback *activeDeviceContentionWithDescriptorCallback;
+    void *activeDeviceContentionWithDescriptorContext;
+    PFXGameSaveDescriptorUiCallback *conflictWithDescriptorCallback;
+    void *conflictWithDescriptorContext;
+};
 
 [
     local,
