@@ -70,7 +70,13 @@ struct pfx_work
     struct PFXGameSaveConfig *config;
     UINT32 kind;
 };
-struct folder_result { char *folder; HRESULT status; };
+/* Folder results live in the title's XAsyncBlock until it reads them, as the
+ * path itself, so XAsyncGetResult copies out the string its size describes.
+ * They are listed here too, so a block that holds anything else -- one reused
+ * from an unrelated call, whose payload is some other operation's -- is
+ * recognised before its payload is read or freed as one of these. */
+struct folder_result { struct list entry; char *folder; HRESULT status; };
+static struct list folder_results = LIST_INIT(folder_results);
 static struct list configs = LIST_INIT(configs);
 static struct PFXGameSaveUiCallbacks callbacks;
 static PFXGameSaveDeviceChangedCallback *device_callback;
@@ -215,33 +221,104 @@ static char *to_utf8( const WCHAR *wide )
     return s;
 }
 
+/* Where initialize_private_sdk notes that the override below is in place,
+ * and what the setting was before it, until it has been put back. */
+static const WCHAR override_marker[] = L"Software\\Wine\\xgameruntime\\ForceUseInprocGameSaves";
+
+/* A run that died inside the private SDK's initialization -- killed, or a
+ * crash in the foreign SDK -- left the override behind, and in a prefix that
+ * is permanent: every later title would find it and pick the in-process
+ * engine, and the next run here would even save it as "the prefix's own
+ * setting". Undo it, but only while it still holds exactly what was written
+ * (REG_DWORD 1); anything else has been set since, deliberately. */
+static void recover_override( HKEY key, const WCHAR *name )
+{
+    BYTE prior[256];
+    DWORD type, size = sizeof(prior), current = 0, current_type, current_size = sizeof(current);
+    HKEY marker;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, override_marker, 0, KEY_QUERY_VALUE, &marker)) return;
+    if (!RegQueryValueExW(key, name, NULL, &current_type, (BYTE *)&current, &current_size) &&
+        current_type == REG_DWORD && current_size == sizeof(current) && current == 1)
+    {
+        if (!RegQueryValueExW(marker, L"Prior", NULL, &type, prior, &size))
+            RegSetValueExW(key, name, 0, type, prior, size);
+        else
+            RegDeleteValueW(key, name);
+        WARN("put back the save provider setting an interrupted earlier run left overridden.\n");
+    }
+    RegCloseKey(marker);
+    RegDeleteKeyW(HKEY_LOCAL_MACHINE, override_marker);
+}
+
 static HRESULT initialize_private_sdk( const char *root )
 {
     static const WCHAR key_name[] = L"Software\\Microsoft\\GamingServices";
     static const WCHAR name[] = L"ForceUseInprocGameSaves";
     BYTE saved[256]; DWORD type = 0, size = sizeof(saved), one = 1;
     LONG status, prior;
-    HKEY key;
+    HKEY key, marker;
     HRESULT hr;
     struct pf_init_args args = { NULL, 0, root };
 
     /* The primary GDK SDK has already selected its GRTS provider before it
      * calls PFXInitializeConfig. Only the private instance selects the native
      * in-process sync engine here. Restore the prefix's exact setting even
-     * when initialization fails; never leave an override for older titles. */
+     * when initialization fails; never leave an override for older titles.
+     * The marker written first is what lets the next run restore it if this
+     * one never gets that far. */
     status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, key_name, 0, NULL, 0,
                             KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL);
     if (status) return HRESULT_FROM_WIN32(status);
+    recover_override(key, name);
     prior = RegQueryValueExW(key, name, NULL, &type, saved, &size);
     if (prior != ERROR_SUCCESS && prior != ERROR_FILE_NOT_FOUND)
     { RegCloseKey(key); return HRESULT_FROM_WIN32(prior); }
+    if (!(status = RegCreateKeyExW(HKEY_LOCAL_MACHINE, override_marker, 0, NULL, 0, KEY_SET_VALUE, NULL, &marker, NULL)))
+    {
+        if (prior == ERROR_SUCCESS) status = RegSetValueExW(marker, L"Prior", 0, type, saved, size);
+        RegCloseKey(marker);
+    }
+    if (status) WARN("could not record the save provider setting, error %ld.\n", status);
     status = RegSetValueExW(key, name, 0, REG_DWORD, (BYTE *)&one, sizeof(one));
     hr = status ? HRESULT_FROM_WIN32(status) : api.initialize(&args);
     if (prior == ERROR_SUCCESS) status = RegSetValueExW(key, name, 0, type, saved, size);
     else status = RegDeleteValueW(key, name);
     RegCloseKey(key);
     if (status && status != ERROR_FILE_NOT_FOUND) return HRESULT_FROM_WIN32(status);
+    RegDeleteKeyW(HKEY_LOCAL_MACHINE, override_marker);
     return hr;
+}
+
+/* The title's PlayFabGameSave.dll, copied to a name of its own so the private
+ * instance is a second module rather than the title's. Reused across runs,
+ * but only once it is known to be whole: a copy cut short -- the disk filled,
+ * the process was killed -- would otherwise be loaded, fail, and disable
+ * PlayFab saves for that title until someone found and deleted it. So the
+ * copy is made under a temporary name and renamed into place, and an existing
+ * one is used only if it is the source's size. */
+static BOOL backend_copy_whole( const WCHAR *path, const WIN32_FILE_ATTRIBUTE_DATA *source )
+{
+    WIN32_FILE_ATTRIBUTE_DATA copy;
+    return GetFileAttributesExW(path, GetFileExInfoStandard, &copy) &&
+           copy.nFileSizeHigh == source->nFileSizeHigh && copy.nFileSizeLow == source->nFileSizeLow;
+}
+
+static HRESULT copy_backend( const WCHAR *source, const WCHAR *destination, const WIN32_FILE_ATTRIBUTE_DATA *attributes )
+{
+    WCHAR temporary[4096];
+    DWORD error;
+    if (backend_copy_whole(destination, attributes)) return S_OK;
+    if (wcslen(destination) + 16 >= ARRAY_SIZE(temporary)) return E_INVALIDARG;
+    swprintf(temporary, ARRAY_SIZE(temporary), L"%s.%08lx.tmp", destination, GetCurrentProcessId());
+    if (!CopyFileW(source, temporary, FALSE)) error = GetLastError();
+    else if (!backend_copy_whole(temporary, attributes)) error = ERROR_FILE_INVALID;
+    else if (!MoveFileExW(temporary, destination, MOVEFILE_REPLACE_EXISTING)) error = GetLastError();
+    else return S_OK;
+    DeleteFileW(temporary);
+    /* another process in this prefix may have put a whole one there first */
+    if (backend_copy_whole(destination, attributes)) return S_OK;
+    WARN("could not copy the PlayFab save backend, error %lu.\n", error);
+    return HRESULT_FROM_WIN32(error);
 }
 
 static void WINAPI ui_progress(void *, UINT32, void *);
@@ -275,10 +352,16 @@ static BOOL CALLBACK load_backend( INIT_ONCE *once, void *parameter, void **cont
     if (!make_dirs(path)) { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
     swprintf(destination, ARRAY_SIZE(destination), L"%s\\pgs-%08lx-%08lx-%08lx.dll", path,
              modified.dwHighDateTime, modified.dwLowDateTime, attributes.nFileSizeLow);
-    if (!CopyFileW(source, destination, TRUE) && GetLastError() != ERROR_FILE_EXISTS)
-    { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
-    api.save = LoadLibraryExW(destination, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!api.save) { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
+    if (FAILED(backend_status = copy_backend(source, destination, &attributes))) goto done;
+    if (!(api.save = LoadLibraryExW(destination, NULL, LOAD_WITH_ALTERED_SEARCH_PATH)))
+    {
+        /* whole but unusable all the same; one fresh copy, then give up */
+        WARN("cached PlayFab save backend did not load, error %lu; copying it again.\n", GetLastError());
+        DeleteFileW(destination);
+        if (FAILED(backend_status = copy_backend(source, destination, &attributes))) goto done;
+        if (!(api.save = LoadLibraryExW(destination, NULL, LOAD_WITH_ALTERED_SEARCH_PATH)))
+        { backend_status = HRESULT_FROM_WIN32(GetLastError()); goto done; }
+    }
 #define LOAD(field, module, name) do { if (!(api.field = (void *)GetProcAddress(api.module, name))) \
     { backend_status = HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND); goto done; } } while (0)
     LOAD(create_service, core, "PFServiceConfigCreateHandle");
@@ -381,7 +464,8 @@ static void CALLBACK work_complete( XAsyncBlock *inner )
         if (result) result->status = hr;
         if (FAILED(hr) && hr != (HRESULT)0x80830004 && result)
         { free(result->folder); free(result); result = NULL; }
-        xgr_async_complete_ex(w->outer, hr, result, result ? size : 0);
+        if (result) { EnterCriticalSection(&pfx_cs); list_add_tail(&folder_results, &result->entry); LeaveCriticalSection(&pfx_cs); }
+        xgr_async_complete_ex(w->outer, hr, result ? result->folder : NULL, result ? size : 0);
     }
     else
     {
@@ -403,6 +487,11 @@ static HRESULT start_work( PFXGameSaveConfigHandle handle, XAsyncBlock *outer, U
     if (!(w = calloc(1, sizeof(*w)))) { release_config(c); return E_OUTOFMEMORY; }
     w->config = c; w->outer = outer; w->kind = kind;
     w->inner.queue = outer->queue; w->inner.context = w; w->inner.callback = work_complete;
+    /* The outcome lands in the caller's block only when the SDK finishes, so
+     * clear what an earlier call left there first, as XAsyncBegin does: a
+     * reused block would otherwise read as complete straight away, with the
+     * previous call's status and payload. */
+    memset(outer->internal, 0, sizeof(outer->internal));
     if (!kind) hr = api.add_user(c->local_user, c->flags & 3, &w->inner);
     else if (kind == 1) hr = api.upload(c->local_user, options, &w->inner);
     else hr = api.description(c->local_user, description, &w->inner);
@@ -418,16 +507,34 @@ HRESULT pfx_description_async( PFXGameSaveConfigHandle c, const char *s, XAsyncB
 
 HRESULT pfx_folder_result( XAsyncBlock *async, SIZE_T size, char *folder )
 {
-    struct folder_result *r;
+    struct folder_result *r = NULL, *known;
     HRESULT hr;
     SIZE_T needed;
+    void *payload;
+    BOOL ours = FALSE, taken = FALSE;
     if (!async || !folder) return E_INVALIDARG;
-    if (!xgr_async_completed(async, &hr, (void **)&r)) return E_PENDING;
-    if (!r) return FAILED(hr) ? hr : E_FAIL;
-    needed = strlen(r->folder) + 1;
-    if (size < needed) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
-    memcpy(folder, r->folder, needed); hr = r->status;
-    free(r->folder); free(r); async->internal[2] = NULL;
+    if (!xgr_async_completed(async, &hr, &payload)) return E_PENDING;
+    if (!payload) return FAILED(hr) ? hr : E_FAIL;
+    EnterCriticalSection(&pfx_cs);
+    LIST_FOR_EACH_ENTRY(known, &folder_results, struct folder_result, entry)
+        if (known->folder == payload) { r = known; ours = TRUE; break; }
+    if (ours)
+    {
+        needed = strlen(r->folder) + 1;
+        if (size < needed) hr = HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        else
+        {
+            memcpy(folder, r->folder, needed); hr = r->status;
+            list_remove(&r->entry); async->internal[2] = NULL; taken = TRUE;
+        }
+    }
+    LeaveCriticalSection(&pfx_cs);
+    if (!ours)
+    {
+        WARN("block %p holds no folder result.\n", async);
+        return E_INVALIDARG;
+    }
+    if (taken) { free(r->folder); free(r); }
     return hr;
 }
 

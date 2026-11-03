@@ -26,7 +26,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
 /*
  * The system UI, offline and headless: there is no overlay to show and no user
  * to click it, so each dialog completes immediately with the outcome a
- * dismissed dialog would give -- the default button for a message box, an empty
+ * dismissed dialog would give -- the cancel button for a message box, an empty
  * pick for a player picker, a cancelled entry for text input. Web
  * authentication cannot happen offline, so it reports cancellation rather than
  * hanging. Returning these instead of E_NOTIMPL keeps a title that waits on a
@@ -88,9 +88,25 @@ static ULONG WINAPI x_game_ui_Release( IXGameUiImpl4 *iface )
 
 static HRESULT WINAPI x_game_ui_XGameUiShowMessageDialogAsync( IXGameUiImpl4 *iface, XAsyncBlock *async, const char *titleText, const char *contentText, const char *firstButtonText, const char *secondButtonText, const char *thirdButtonText, XGameUiMessageDialogButton defaultButton, XGameUiMessageDialogButton cancelButton )
 {
-    TRACE( "iface %p, async %p, titleText %s, contentText %s, defaultButton %d.\n", iface, async, debugstr_a( titleText ), debugstr_a( contentText ), defaultButton );
+    const char *texts[] = { firstButtonText, secondButtonText, thirdButtonText };
+    XGameUiMessageDialogButton button = cancelButton;
+
+    TRACE( "iface %p, async %p, titleText %s, contentText %s, defaultButton %d, cancelButton %d.\n", iface, async, debugstr_a( titleText ), debugstr_a( contentText ), defaultButton, cancelButton );
     if (!async) return E_INVALIDARG;
-    xgr_async_complete( async, S_OK, (void *)(ULONG_PTR)defaultButton );
+
+    /* Nobody sees the dialog, so it is dismissed, and dismissing a message box
+     * (B, or Escape) picks its cancel button. The default button is only the
+     * one that has focus, and for the prompts that matter -- "delete this
+     * corrupted save?", "overwrite?" -- it is often the destructive answer,
+     * which must never be given on the player's behalf. Only a button that
+     * has no text, and so does not exist, falls back to one that does. */
+    if ((UINT32)button >= ARRAY_SIZE(texts) || !texts[button])
+    {
+        button = (UINT32)defaultButton < ARRAY_SIZE(texts) && texts[defaultButton] ? defaultButton
+                                                                                  : XGameUiMessageDialogButton_First;
+        WARN( "cancel button %d has no text; dismissing to button %d.\n", cancelButton, button );
+    }
+    xgr_async_complete( async, S_OK, (void *)(ULONG_PTR)button );
     return S_OK;
 }
 

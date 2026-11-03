@@ -106,6 +106,8 @@ BOOL WINAPI DllMain( HINSTANCE hinst, DWORD reason, void *reserved )
             TlsSetValue( tlsIndex, FALSE );
             break;
         case DLL_PROCESS_DETACH:
+            /* process exit only (reserved is set): the save writer is gone */
+            if (reserved) xgr_save_process_exit();
             if (fault_trace_handler) RemoveVectoredExceptionHandler(fault_trace_handler);
             TlsFree( tlsIndex );
             break;

@@ -151,6 +151,10 @@ void xgr_title_identity( char *title_id, SIZE_T title_id_len, char *client_id, S
 /* Wrap a UTF-8 filesystem path in an XPackageMountHandle (from xpackage.c). */
 void *xgr_make_mount( const char *path );
 
+/* Write the game saves still queued for the background writer (xgamesave.c);
+ * called once at process exit. */
+void xgr_save_process_exit( void );
+
 static inline BOOL xgr_async_completed( const XAsyncBlock *async, HRESULT *hr, void **payload )
 {
     if (!async || async->internal[0] != XGR_ASYNC_MAGIC) return FALSE;

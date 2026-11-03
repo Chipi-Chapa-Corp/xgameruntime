@@ -109,18 +109,22 @@ static char *current_mount_path( void )
     return path;
 }
 
-/* MicrosoftGame.config text, loaded once (inline or from disk). */
+/* MicrosoftGame.config text, loaded once (inline or from disk). Under an
+ * InitOnce, so threads asking at the same time share one copy rather than
+ * each loading their own. */
+static BOOL WINAPI init_game_config( INIT_ONCE *once, void *param, void **context )
+{
+    *context = xgr_load_game_config();
+    return TRUE;
+}
+
 static const char *game_config( void )
 {
-    static char *cached;
-    static BOOL loaded;
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    void *config = NULL;
 
-    if (!loaded)
-    {
-        cached = xgr_load_game_config();
-        loaded = TRUE;
-    }
-    return cached;
+    InitOnceExecuteOnce( &once, init_game_config, NULL, &config );
+    return config;
 }
 
 /* See private.h: the text of <element>text</element> in MicrosoftGame.config. */
