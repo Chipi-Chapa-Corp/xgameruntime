@@ -183,3 +183,17 @@ void xgr_role_watch_close(enum xgr_role_watch_kind, void *);
  * status. */
 BOOL xgr_role_entitlement( UINT32 *active, BOOL fresh );
 void xgr_role_entitlement_store( LONG status /* NTSTATUS */, UINT32 active );
+
+/* Installed related content, immutable for the lifetime of a launch. */
+struct xgr_related_package
+{
+    XPackageDetails details;
+    char identifier[33], store[64], title[256], description[512], publisher[256], title_id[64];
+    char *path;
+};
+unsigned int xgr_related_packages( const struct xgr_related_package **packages );
+const struct xgr_related_package *xgr_related_by_id( const char *id );
+
+BOOL xgr_role_product_entitlement( const char *, UINT32 *, BOOL );
+void xgr_role_product_entitlement_store( const char *, LONG, UINT32 );
+const char *xgr_store_license_product( void * );

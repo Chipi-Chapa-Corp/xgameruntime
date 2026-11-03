@@ -308,7 +308,7 @@ static BOOL get_live_identity( UINT64 *xuid, char *gamertag, SIZE_T gamertag_siz
  * not answer in time gets the last state, as during any outage. Freshness
  * bound, then: while polled, about ROLE_POLL_MS plus one exchange; after a
  * quiet spell, current unless the service took longer than the wait. */
-enum role_source { ROLE_SOURCE_ACCOUNTS, ROLE_SOURCE_ENTITLEMENT, ROLE_SOURCE_COUNT };
+enum role_source { ROLE_SOURCE_ACCOUNTS, ROLE_SOURCE_ENTITLEMENT, ROLE_SOURCE_RELATED, ROLE_SOURCE_COUNT = ROLE_SOURCE_RELATED + 128 };
 #define ROLE_POLL_MS       1000
 #define ROLE_DEMAND_MS     30000
 #define ROLE_FRESH_MS      3000
@@ -321,6 +321,7 @@ enum role_source { ROLE_SOURCE_ACCOUNTS, ROLE_SOURCE_ENTITLEMENT, ROLE_SOURCE_CO
 static struct role_source_state
 {
     BOOL known, seeded, started;
+    char product[13];
     struct account_roles_params roles;  /* ROLE_SOURCE_ACCOUNTS */
     UINT32 active;                      /* ROLE_SOURCE_ENTITLEMENT */
     ULONGLONG wanted_until;
@@ -373,6 +374,11 @@ static NTSTATUS role_state_fetch( enum role_source source )
     NTSTATUS status;
 
     if (source == ROLE_SOURCE_ACCOUNTS) status = XGR_UNIX_CALL( account_roles, &roles );
+    else if (source >= ROLE_SOURCE_RELATED)
+    {
+        memcpy( entitlement.store_id, role_state[source].product, 13 );
+        status = XGR_UNIX_CALL( store_entitlement, &entitlement );
+    }
     else if (!xgr_config_element( "StoreId", entitlement.store_id, sizeof(entitlement.store_id) ))
         return STATUS_NOT_FOUND;
     else status = XGR_UNIX_CALL( store_entitlement, &entitlement );
@@ -491,6 +497,44 @@ void xgr_role_entitlement_store( NTSTATUS status, UINT32 active )
 {
     role_state_store( ROLE_SOURCE_ENTITLEMENT, status, NULL, active );
     role_state_note_checked( ROLE_SOURCE_ENTITLEMENT );
+}
+
+/* Related packages have independent licence state and pollers. A failed or
+ * revoked add-on must never seed or invalidate the base game's cached grant. */
+static enum role_source role_product_source( const char *product )
+{
+    enum role_source source;
+    char current[64];
+    if (!product || !*product) return ROLE_SOURCE_ENTITLEMENT;
+    xgr_config_element( "StoreId", current, sizeof(current) );
+    if (!strcmp( product, current )) return ROLE_SOURCE_ENTITLEMENT;
+    AcquireSRWLockExclusive( &role_state_lock );
+    for (source = ROLE_SOURCE_RELATED; source < ROLE_SOURCE_COUNT; source++)
+    {
+        if (!role_state[source].product[0])
+        {
+            snprintf( role_state[source].product, sizeof(role_state[source].product), "%s", product );
+            break;
+        }
+        if (!strcmp( role_state[source].product, product )) break;
+    }
+    ReleaseSRWLockExclusive( &role_state_lock );
+    return source;
+}
+
+BOOL xgr_role_product_entitlement( const char *product, UINT32 *active, BOOL fresh )
+{
+    enum role_source source = role_product_source( product );
+    if (source == ROLE_SOURCE_COUNT) return FALSE;
+    return role_state_get( source, fresh ? ROLE_GET_FRESH : 0, NULL, active );
+}
+
+void xgr_role_product_entitlement_store( const char *product, NTSTATUS status, UINT32 active )
+{
+    enum role_source source = role_product_source( product );
+    if (source == ROLE_SOURCE_COUNT) return;
+    role_state_store( source, status, NULL, active );
+    role_state_note_checked( source );
 }
 
 static HRESULT WINAPI x_user_XUserDuplicateHandle( IXUserImpl6 *iface, XUserHandle handle, XUserHandle *duplicatedHandle )
@@ -995,6 +1039,7 @@ struct role_watch
     LONG refs;
     UINT64 token;
     enum xgr_role_watch_kind kind;
+    enum role_source source;
     void *owner, *context;
     XTaskQueueHandle queue;
     XUserChangeEventCallback *user_callback;
@@ -1009,8 +1054,9 @@ static SRWLOCK role_watches_lock = SRWLOCK_INIT;
 static struct role_watch *role_watches;
 static UINT64 role_watch_next_token = 0x10000;
 
-static enum role_source role_watch_source( enum xgr_role_watch_kind kind )
+static enum role_source role_watch_source( enum xgr_role_watch_kind kind, void *owner )
 {
+    if (kind == XGR_ROLE_WATCH_PACKAGE) return role_product_source( xgr_store_license_product( owner ) );
     return kind == XGR_ROLE_WATCH_USER ? ROLE_SOURCE_ACCOUNTS : ROLE_SOURCE_ENTITLEMENT;
 }
 
@@ -1089,7 +1135,7 @@ static void role_watches_update( enum role_source source )
     AcquireSRWLockShared(&role_watches_lock);
     for (watch = role_watches; watch; watch = watch->next)
     {
-        if (role_watch_source(watch->kind) != source) continue;
+        if (watch->source != source) continue;
         if (count == capacity)
         {
             capacity = capacity ? capacity * 2 : 8;
@@ -1121,6 +1167,8 @@ HRESULT xgr_role_watch_register( enum xgr_role_watch_kind kind, void *owner, XTa
     InitializeCriticalSection(&watch->lock);
     InitializeConditionVariable(&watch->idle);
     watch->refs = 1; /* the registration */
+    watch->source = role_watch_source(kind,owner);
+    if (watch->source == ROLE_SOURCE_COUNT) { role_watch_release(watch); return E_OUTOFMEMORY; }
     watch->kind = kind; watch->owner = owner; watch->context = context;
     watch->user_callback = user_callback; watch->store_callback = store_callback;
     watch->known = initial >= 0; watch->state = initial > 0;
@@ -1129,7 +1177,7 @@ HRESULT xgr_role_watch_register( enum xgr_role_watch_kind kind, void *owner, XTa
     watch->next = role_watches; role_watches = watch;
     token->token = watch->token;
     ReleaseSRWLockExclusive(&role_watches_lock);
-    role_source_want(role_watch_source(kind),1,NULL);
+    role_source_want(watch->source,1,NULL);
     return S_OK;
 }
 
@@ -1144,7 +1192,7 @@ BOOLEAN xgr_role_watch_unregister( enum xgr_role_watch_kind kind, void *owner,
         { watch = *link; *link = watch->next; break; }
     ReleaseSRWLockExclusive(&role_watches_lock);
     if (!watch) return TRUE;
-    role_source_want(role_watch_source(kind),-1,NULL);
+    role_source_want(watch->source,-1,NULL);
     EnterCriticalSection(&watch->lock);
     watch->stopped = TRUE;
     while (wait && watch->callback_thread && watch->callback_thread != GetCurrentThreadId())

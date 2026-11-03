@@ -35,7 +35,7 @@
 #include "private.h"
 #include <bcrypt.h>
 
-WINE_DEFAULT_DEBUG_CHANNEL(gdkc);
+WINE_DEFAULT_DEBUG_CHANNEL(xpackage);
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -519,15 +519,195 @@ static HRESULT WINAPI __PADDING_4__( IXPackageImpl3 *iface )
 
 /* ---- enumeration -------------------------------------------------------- */
 
-static HRESULT enumerate_current( XPackageKind kind, void *context, XPackageEnumerationCallback *callback )
+/* The launcher supplies only installed content related to this game. Recheck
+ * both manifest relationships before exposing any of it. This is installation
+ * discovery, not a grant of ownership or a substitute for Store licensing. */
+static BOOL xml_attr( const char *xml, const char *element, const char *attr, char *out, SIZE_T cap )
+{
+    const char *start, *end, *value;
+    SIZE_T len;
+
+    out[0] = 0;
+    if (!(start = strstr( xml, element )) || !(end = strchr( start, '>' )) ||
+        !(value = strstr( start, attr )) || value > end) return FALSE;
+    value += strlen( attr );
+    len = strcspn( value, "\"" );
+    if (len >= cap) return FALSE;
+    memcpy( out, value, len );
+    out[len] = 0;
+    return TRUE;
+}
+
+static BOOL xml_element( const char *xml, const char *element, char *out, SIZE_T cap )
+{
+    char tag[64];
+    const char *value;
+    SIZE_T len;
+
+    out[0] = 0;
+    snprintf( tag, sizeof(tag), "<%s>", element );
+    if (!(value = strstr( xml, tag ))) return FALSE;
+    value += strlen( tag );
+    len = strcspn( value, "<" );
+    if (len >= cap) return FALSE;
+    memcpy( out, value, len );
+    out[len] = 0;
+    return TRUE;
+}
+
+static struct xgr_related_package related[128];
+static unsigned int related_count;
+
+static BOOL read_related( const WCHAR *unix_path, const char *allowed, const char *dependency )
+{
+    static const char hex[] = "0123456789abcdef";
+    struct xgr_related_package *p = related + related_count;
+    unsigned int i, a = 0, b = 0, c = 0, d = 0;
+    char *xml, *root, version[64];
+    WCHAR *file;
+    HANDLE handle;
+    DWORD size, read;
+    UCHAR random[16];
+
+    size = wcslen( unix_path );
+    if (*unix_path != '/' || size > 32700 || !(file = calloc( size + 32, sizeof(WCHAR) ))) return FALSE;
+    file[0] = 'Z';
+    file[1] = ':';
+    wcscpy( file + 2, unix_path );
+    for (i = 2; file[i]; i++) if (file[i] == '/') file[i] = '\\';
+    root = wide_to_utf8( file );
+    wcscat( file, L"\\MicrosoftGame.config" );
+    handle = CreateFileW( file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    free( file );
+    if (!root || handle == INVALID_HANDLE_VALUE)
+    {
+        if (handle != INVALID_HANDLE_VALUE) CloseHandle( handle );
+        free( root );
+        return FALSE;
+    }
+    size = GetFileSize( handle, NULL );
+    if (!size || size > 1024 * 1024 || !(xml = calloc( size + 1, 1 )))
+    {
+        CloseHandle( handle );
+        free( root );
+        return FALSE;
+    }
+    if (!ReadFile( handle, xml, size, &read, NULL ) || read != size)
+    {
+        CloseHandle( handle );
+        free( xml );
+        free( root );
+        return FALSE;
+    }
+    CloseHandle( handle );
+    if (!strstr( xml, allowed ) || !strstr( xml, dependency )) goto invalid;
+    xml_element( xml, "StoreId", p->store, sizeof(p->store) );
+    if (strlen( p->store ) != 12 || BCryptGenRandom( NULL, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG ))
+        goto invalid;
+
+    xml_attr( xml, "<ShellVisuals", " DefaultDisplayName=\"", p->title, sizeof(p->title) );
+    xml_attr( xml, "<ShellVisuals", " Description=\"", p->description, sizeof(p->description) );
+    xml_attr( xml, "<ShellVisuals", " PublisherDisplayName=\"", p->publisher, sizeof(p->publisher) );
+    xml_attr( xml, "<Identity", " Version=\"", version, sizeof(version) );
+    sscanf( version, "%u.%u.%u.%u", &a, &b, &c, &d );
+    for (i = 0; i < sizeof(random); i++)
+    {
+        p->identifier[2 * i] = hex[random[i] >> 4];
+        p->identifier[2 * i + 1] = hex[random[i] & 15];
+    }
+    p->path = root;
+    p->details.packageIdentifier = p->identifier;
+    p->details.kind = XPackageKind_Content;
+    p->details.storeId = p->store;
+    p->details.displayName = p->title;
+    p->details.description = p->description;
+    p->details.publisher = p->publisher;
+    p->details.titleID = p->title_id;
+    p->details.count = 1;
+    p->details.version.major = a;
+    p->details.version.minor = b;
+    p->details.version.build = c;
+    p->details.version.revision = d;
+    free( xml );
+    return TRUE;
+
+invalid:
+    free( xml );
+    free( root );
+    memset( p, 0, sizeof(*p) );
+    return FALSE;
+}
+
+static BOOL WINAPI init_related( INIT_ONCE *once, void *param, void **context )
+{
+    WCHAR *paths, *at, *next;
+    char allowed[96], dependency[512], current[64], identity[256];
+    DWORD size;
+
+    size = GetEnvironmentVariableW( L"XGR_RELATED_PACKAGE_PATHS", NULL, 0 );
+    if (!size || size > 65536) return TRUE;
+    if (!(paths = calloc( size, sizeof(WCHAR) ))) return FALSE;
+    if (!GetEnvironmentVariableW( L"XGR_RELATED_PACKAGE_PATHS", paths, size ))
+    {
+        free( paths );
+        return TRUE;
+    }
+    xgr_config_element( "StoreId", current, sizeof(current) );
+    xgr_config_attr( "<Identity", " Name=\"", identity, sizeof(identity) );
+    snprintf( allowed, sizeof(allowed), "<AllowedProduct>%s</AllowedProduct>", current );
+    snprintf( dependency, sizeof(dependency), "<MainPackageDependency Name=\"%s\"", identity );
+    for (at = paths; at && *at && related_count < ARRAY_SIZE(related); at = next)
+    {
+        next = wcschr( at, '\n' );
+        if (next) *next++ = 0;
+        if (read_related( at, allowed, dependency )) related_count++;
+    }
+    free( paths );
+    return TRUE;
+}
+
+unsigned int xgr_related_packages( const struct xgr_related_package **packages )
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+
+    InitOnceExecuteOnce( &once, init_related, NULL, NULL );
+    *packages = related;
+    return related_count;
+}
+
+const struct xgr_related_package *xgr_related_by_id( const char *id )
+{
+    const struct xgr_related_package *packages;
+    unsigned int i, count = xgr_related_packages( &packages );
+
+    for (i = 0; id && i < count; i++)
+        if (!strcmp( id, packages[i].identifier )) return packages + i;
+    return NULL;
+}
+
+static HRESULT enumerate_current( XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
 {
     XPackageDetails details;
     const char *identifier;
     char display[256], description[512], publisher[256], store_id[64], title_id[64];
 
     if (!callback) return E_INVALIDARG;
-    /* only games are installed here; a Content query finds nothing */
-    if (kind != XPackageKind_Game) return S_OK;
+    if (kind == XPackageKind_Content)
+    {
+        const struct xgr_related_package *packages;
+        unsigned int i, count;
+
+        if (scope == XPackageEnumerationScope_ThisOnly) return S_OK;
+        count = xgr_related_packages( &packages );
+        for (i = 0; i < count; i++)
+        {
+            TRACE_(xpackage)( "reporting installed related package %s, store %s\n",
+                   debugstr_a( packages[i].identifier ), debugstr_a( packages[i].store ) );
+            if (!callback( context, &packages[i].details )) break;
+        }
+        return S_OK;
+    }
+    if (kind != XPackageKind_Game) return E_INVALIDARG;
 
     if (!(identifier = xgr_current_package_identifier())) return HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE );
 
@@ -555,7 +735,7 @@ static HRESULT enumerate_current( XPackageKind kind, void *context, XPackageEnum
 static HRESULT WINAPI x_package_XPackageEnumeratePackages( IXPackageImpl3 *iface, XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
 {
     TRACE( "iface %p, kind %d, scope %d, context %p, callback %p.\n", iface, kind, scope, context, callback );
-    return enumerate_current( kind, context, callback );
+    return enumerate_current( kind, scope, context, callback );
 }
 
 static HRESULT WINAPI x_package_XPackageRegisterPackageInstalled( IXPackageImpl3 *iface, XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
@@ -605,7 +785,7 @@ static BOOLEAN WINAPI x_package_XPackageUninstallPackage( IXPackageImpl3 *iface,
 static HRESULT WINAPI x_package_XPackageEnumeratePackages2( IXPackageImpl3 *iface, XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
 {
     TRACE( "iface %p, kind %d, scope %d, context %p, callback %p.\n", iface, kind, scope, context, callback );
-    return enumerate_current( kind, context, callback );
+    return enumerate_current( kind, scope, context, callback );
 }
 
 static HRESULT WINAPI x_package_XPackageRegisterPackageInstalled2( IXPackageImpl3 *iface, XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
@@ -627,13 +807,16 @@ static HRESULT WINAPI x_package_XPackageMountWithUiAsync( IXPackageImpl3 *iface,
         xgr_async_complete( async, E_OUTOFMEMORY, NULL );
         return S_OK;
     }
-    /* only the game's own content is present, so every mount resolves to the
-     * install root; a title mounting its own package gets a working path */
-    if (!(mount->path = current_mount_path()))
+    /* Enumerated content mounts its own installation; the current game keeps
+     * the existing install-root mount behavior. */
     {
-        free( mount );
-        xgr_async_complete( async, HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE ), NULL );
-        return S_OK;
+        const struct xgr_related_package *p = xgr_related_by_id( packageIdentifier );
+        if (!(mount->path = p ? strdup( p->path ) : current_mount_path()))
+        {
+            free( mount );
+            xgr_async_complete( async, HRESULT_FROM_WIN32( ERROR_INSTALL_FAILURE ), NULL );
+            return S_OK;
+        }
     }
     xgr_async_complete( async, S_OK, mount );
     return S_OK;
@@ -655,7 +838,7 @@ static HRESULT WINAPI x_package_XPackageMountWithUiResult( IXPackageImpl3 *iface
 static HRESULT WINAPI x_package_XPackageEnumeratePackages3( IXPackageImpl3 *iface, XPackageKind kind, XPackageEnumerationScope scope, void *context, XPackageEnumerationCallback *callback )
 {
     TRACE( "iface %p, kind %d, scope %d, context %p, callback %p.\n", iface, kind, scope, context, callback );
-    return enumerate_current( kind, context, callback );
+    return enumerate_current( kind, scope, context, callback );
 }
 
 static HRESULT WINAPI x_package_XPackageRegisterPackageInstalled3( IXPackageImpl3 *iface, XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
