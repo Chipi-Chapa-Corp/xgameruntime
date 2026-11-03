@@ -382,6 +382,8 @@ static HRESULT CALLBACK role_store_provider( XAsyncOp operation, const XAsyncPro
         return IXThreadingImpl_XAsyncSchedule(x_threading_impl,data->async,0);
     case XAsyncOp_DoWork:
         status = XGR_UNIX_CALL(store_entitlement,&op->ipc);
+        /* Every definitive answer refreshes what the cheap checks report. */
+        xgr_role_entitlement_store(status,op->ipc.active);
         hr = status == STATUS_IO_TIMEOUT ? HRESULT_FROM_WIN32(ERROR_TIMEOUT) : status ? E_FAIL : S_OK;
         if (SUCCEEDED(hr)) switch (op->kind)
         {
@@ -716,16 +718,20 @@ static HRESULT WINAPI x_store_XStoreAcquireLicenseForPackageResult( IXStoreImpl6
     return hr;
 }
 
+/* A local check, as on Windows: the entitlement is kept current off the
+ * title's threads (xuser.c), and this reads it. Only a definitive answer moves
+ * the handle, either way -- an unreachable service leaves it as it was rather
+ * than invalidating it for the rest of the session, and a Store account that
+ * signs back in makes it valid again. */
 static BOOLEAN WINAPI x_store_XStoreIsLicenseValid( IXStoreImpl6 *iface, const XStoreLicenseHandle storeLicenseHandle )
 {
     struct x_store_license *lic = storeLicenseHandle;
-    struct store_entitlement_params entitlement = {{0}};
+    UINT32 active;
 
     TRACE( "iface %p, storeLicenseHandle %p.\n", iface, storeLicenseHandle );
     if (lic && lic->verified)
     {
-        if (!xgr_config_element("StoreId",entitlement.store_id,sizeof(entitlement.store_id)) ||
-            XGR_UNIX_CALL(store_entitlement,&entitlement) || !entitlement.active) lic->valid = FALSE;
+        if (xgr_role_entitlement(&active)) lic->valid = !!active;
         return lic->valid;
     }
     return lic && lic->valid;
@@ -864,9 +870,19 @@ static HRESULT WINAPI x_store_XStoreReportConsumableFulfillmentResult( IXStoreIm
     return E_NOTIMPL;
 }
 
+/* serviceTicket is a bearer credential from the title's own service, and
+ * publisherUserId identifies the player to it: neither belongs in a log, which
+ * gets attached to bug reports. Say whether they came and how long they are. */
+static SIZE_T secret_length( const char *value )
+{
+    return value ? strnlen( value, 65536 ) : 0;
+}
+
 static HRESULT WINAPI x_store_XStoreGetUserCollectionsIdAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char *serviceTicket, const char *publisherUserId, XAsyncBlock *async )
 {
-    TRACE( "iface %p, storeContextHandle %p, async %p.\n", iface, storeContextHandle, async );
+    TRACE( "iface %p, storeContextHandle %p, serviceTicket %s (%Iu chars), publisherUserId %s (%Iu chars), async %p.\n",
+           iface, storeContextHandle, serviceTicket ? "present" : "absent", secret_length( serviceTicket ),
+           publisherUserId ? "present" : "absent", secret_length( publisherUserId ), async );
     if (!async) return E_INVALIDARG;
     xgr_async_complete( async, S_OK, NULL );
     return S_OK;
@@ -896,7 +912,9 @@ static HRESULT WINAPI x_store_XStoreGetUserCollectionsIdResult( IXStoreImpl6 *if
 
 static HRESULT WINAPI x_store_XStoreGetUserPurchaseIdAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char *serviceTicket, const char *publisherUserId, XAsyncBlock *async )
 {
-    TRACE( "iface %p, storeContextHandle %p, async %p.\n", iface, storeContextHandle, async );
+    TRACE( "iface %p, storeContextHandle %p, serviceTicket %s (%Iu chars), publisherUserId %s (%Iu chars), async %p.\n",
+           iface, storeContextHandle, serviceTicket ? "present" : "absent", secret_length( serviceTicket ),
+           publisherUserId ? "present" : "absent", secret_length( publisherUserId ), async );
     if (!async) return E_INVALIDARG;
     xgr_async_complete( async, S_OK, NULL );
     return S_OK;
@@ -1147,14 +1165,16 @@ static HRESULT WINAPI x_store_XStoreQueryPackageIdentifier( IXStoreImpl6 *iface,
 
 static HRESULT WINAPI x_store_XStoreRegisterGameLicenseChanged( IXStoreImpl6 *iface, XStoreContextHandle storeContextHandle, XTaskQueueHandle queue, void *context, XStoreGameLicenseChangedCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    struct store_entitlement_params entitlement = {{0}};
+    char store_id[64];
+    UINT32 active;
 
     TRACE( "iface %p, storeContextHandle %p, queue %p, context %p, callback %p, token %p.\n", iface, storeContextHandle, queue, context, callback, token );
     if (account_roles_enabled())
     {
-        if (!storeContextHandle || !xgr_config_element("StoreId",entitlement.store_id,sizeof(entitlement.store_id))) return E_INVALIDARG;
+        if (!storeContextHandle || !xgr_config_element("StoreId",store_id,sizeof(store_id))) return E_INVALIDARG;
+        /* No request here: the watch takes the first answer as its baseline. */
         return xgr_role_watch_register(XGR_ROLE_WATCH_GAME,storeContextHandle,queue,context,NULL,callback,
-            !XGR_UNIX_CALL(store_entitlement,&entitlement) && entitlement.active,token);
+            xgr_role_entitlement(&active) ? (int)!!active : -1,token);
     }
     /* Legacy mode has no live Store state. */
     if (token) token->token = 1;
@@ -1175,7 +1195,7 @@ static HRESULT WINAPI x_store_XStoreRegisterPackageLicenseLost( IXStoreImpl6 *if
     {
         struct x_store_license *license = storeLicenseHandle;
         if (!license || !license->verified) return E_INVALIDARG;
-        return xgr_role_watch_register(XGR_ROLE_WATCH_PACKAGE,storeLicenseHandle,queue,context,NULL,callback,license->valid,token);
+        return xgr_role_watch_register(XGR_ROLE_WATCH_PACKAGE,storeLicenseHandle,queue,context,NULL,callback,!!license->valid,token);
     }
     /* Legacy mode has no live Store state. */
     if (token) token->token = 1;

@@ -129,239 +129,10 @@ static const char *xodus_runtime_dir(void)
     return override && *override ? override : getenv("XDG_RUNTIME_DIR");
 }
 
-static int connect_service( void )
-{
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    const char *runtime_dir = xodus_runtime_dir();
-    int fd;
-
-    if (!runtime_dir || !runtime_dir[0])
-    {
-        WARN( "XDG_RUNTIME_DIR is not set; cannot reach xodus-service.\n" );
-        return -1;
-    }
-    if (snprintf( addr.sun_path, sizeof(addr.sun_path), "%s/xodus.sock", runtime_dir ) >= (int)sizeof(addr.sun_path))
-    {
-        WARN( "socket path does not fit.\n" );
-        return -1;
-    }
-
-    if ((fd = socket( AF_UNIX, SOCK_STREAM, 0 )) < 0) return -1;
-    if (connect( fd, (struct sockaddr *)&addr, sizeof(addr) ))
-    {
-        WARN( "xodus-service is not listening on %s (%s); no Xbox Live sign-in.\n",
-              addr.sun_path, strerror( errno ) );
-        close( fd );
-        return -1;
-    }
-    return fd;
-}
-
-static BOOL write_all( int fd, const void *buf, size_t len )
-{
-    const char *p = buf;
-
-    while (len)
-    {
-        ssize_t n = write( fd, p, len );
-        if (n < 0)
-        {
-            if (errno == EINTR) continue;
-            return FALSE;
-        }
-        if (!n) return FALSE;
-        p += n;
-        len -= n;
-    }
-    return TRUE;
-}
-
-static BOOL read_all( int fd, void *buf, size_t len )
-{
-    char *p = buf;
-
-    while (len)
-    {
-        ssize_t n = read( fd, p, len );
-        if (n < 0)
-        {
-            if (errno == EINTR) continue;
-            return FALSE;
-        }
-        if (!n) return FALSE;
-        p += n;
-        len -= n;
-    }
-    return TRUE;
-}
-
-/* Copy the text between <tag> and </tag> into out. The service's replies are
- * small, flat and machine-generated, so a scan is enough and saves dragging an
- * XML parser into the unix side. */
-static void extract_tag( const char *xml, const char *tag, char *out, size_t out_len )
-{
-    char open_tag[64], close_tag[64];
-    const char *start, *end;
-    size_t len;
-
-    out[0] = 0;
-    snprintf( open_tag, sizeof(open_tag), "<%s>", tag );
-    snprintf( close_tag, sizeof(close_tag), "</%s>", tag );
-
-    if (!(start = strstr( xml, open_tag ))) return;
-    start += strlen( open_tag );
-    if (!(end = strstr( start, close_tag ))) return;
-
-    len = end - start;
-    if (len >= out_len) len = out_len - 1;
-    memcpy( out, start, len );
-    out[len] = 0;
-}
-
-static NTSTATUS xsts_token_once( void *args )
-{
-    struct xsts_token_params *params = args;
-    char *request = NULL, header[8], *body = NULL, *body_b64 = NULL;
-    unsigned int extended_size;
-    char *url_esc = NULL, *method_esc = NULL, *title_esc = NULL, *client_esc = NULL;
-    unsigned int magic, size;
-    unsigned short type, len;
-    NTSTATUS status = STATUS_UNSUCCESSFUL;
-    char expiry[XGR_IDENTITY_MAX];
-    int fd, body_len;
-    size_t request_size;
-
-    params->token[0] = params->xuid[0] = params->gamertag[0] = params->signature[0] = 0;
-    params->expiry = 0;
-
-    if ((fd = connect_service()) < 0) return STATUS_NOT_FOUND;
-
-    /* The signature covers the body, so it has to travel with the ask; base64
-     * keeps arbitrary bytes safe inside the XML. */
-    if (params->body_size > 6 * 1024 * 1024)
-    { status = STATUS_INVALID_BUFFER_SIZE; goto done; }
-    if (params->body && params->body_size)
-    {
-        if (!(body_b64 = base64_encode( params->body, params->body_size ))) goto done;
-    }
-
-    if (!(url_esc = xml_escape( params->url )) ||
-        !(method_esc = xml_escape( params->method ? params->method : "GET" )) ||
-        !(title_esc = xml_escape( params->title_id ? params->title_id : "" )) ||
-        !(client_esc = xml_escape( params->title_client_id ? params->title_client_id : "" )))
-    { status = STATUS_NO_MEMORY; goto done; }
-
-    request_size = 512 + strlen( url_esc ) + strlen( method_esc ) +
-                   strlen( title_esc ) + strlen( client_esc ) +
-                   (body_b64 ? strlen( body_b64 ) : 0);
-    if (!(request = malloc( request_size ))) { status = STATUS_NO_MEMORY; goto done; }
-
-    /* RelyingParty stays empty on purpose: the service resolves it from the
-     * title-management endpoint list, which is authoritative and knows hosts
-     * this side does not. TitleId and MSAAppId, on the other hand, only this
-     * side can see -- they come out of the game's own MicrosoftGame.config. */
-    body_len = snprintf( request, request_size,
-                         "<XSTSTokenRequest><Url>%s</Url><RelyingParty></RelyingParty>"
-                         "<Method>%s</Method><TitleId>%s</TitleId>"
-                         "<TitleClientId>%s</TitleClientId>"
-                         "<BodyBase64>%s</BodyBase64></XSTSTokenRequest>",
-                         url_esc, method_esc, title_esc, client_esc,
-                         body_b64 ? body_b64 : "" );
-    if (body_len < 0 || body_len >= (int)request_size) goto done;
-    if (body_len > 8 * 1024 * 1024)
-    { status = STATUS_INVALID_BUFFER_SIZE; goto done; }
-
-    magic = XODUS_XML_MAGIC;
-    type = XODUS_XSTS_TOKEN_REQUEST | (body_len > 0xffff ? 0x8000 : 0);
-    len = body_len > 0xffff ? 0xffff : body_len;
-    memcpy( header, &magic, 4 );
-    memcpy( header + 4, &type, 2 );
-    memcpy( header + 6, &len, 2 );
-
-    if (!write_all( fd, header, sizeof(header) )) goto done;
-    extended_size = body_len;
-    if (body_len > 0xffff && !write_all( fd, &extended_size, sizeof(extended_size) )) goto done;
-    if (!write_all( fd, request, body_len )) goto done;
-
-    if (!read_all( fd, header, sizeof(header) )) goto done;
-    memcpy( &magic, header, 4 );
-    memcpy( &type, header + 4, 2 );
-    memcpy( &len, header + 6, 2 );
-    if (magic != XODUS_XML_MAGIC || type != XODUS_XSTS_TOKEN_REQUEST + 1)
-    {
-        WARN( "unexpected reply magic %#x.\n", magic );
-        goto done;
-    }
-    if (!len)
-    {
-        WARN( "xodus-service returned no token; the account may not be signed in.\n" );
-        status = STATUS_LOGON_FAILURE;
-        goto done;
-    }
-
-    size = len;
-    if (!(body = malloc( size + 1 ))) { status = STATUS_NO_MEMORY; goto done; }
-    if (!read_all( fd, body, size )) goto done;
-    body[size] = 0;
-
-    extract_tag( body, "Token", params->token, sizeof(params->token) );
-    extract_tag( body, "Xuid", params->xuid, sizeof(params->xuid) );
-    extract_tag( body, "Gamertag", params->gamertag, sizeof(params->gamertag) );
-    extract_tag( body, "Signature", params->signature, sizeof(params->signature) );
-    extract_tag( body, "Expiry", expiry, sizeof(expiry) );
-    params->expiry = atoll( expiry );
-
-    if (!params->token[0])
-    {
-        status = STATUS_LOGON_FAILURE;
-        goto done;
-    }
-
-    TRACE( "got a %zu-character token for %s (gamertag %s).\n",
-           strlen( params->token ), debugstr_a( params->url ), debugstr_a( params->gamertag ) );
-    status = STATUS_SUCCESS;
-
-done:
-    free( url_esc );
-    free( method_esc );
-    free( title_esc );
-    free( client_esc );
-    free( request );
-    free( body_b64 );
-    free( body );
-    close( fd );
-    return status;
-}
-
-/* Ask again after a transient failure. The service is a separate process, so a
- * request can lose a race with it at startup -- and the caller here is usually
- * resolving the signed-in account, where giving up once meant the title showed
- * nobody signed in until it was restarted. A refused sign-in is not transient
- * and is returned as it stands. */
-static NTSTATUS xsts_token( void *args )
-{
-    static const int backoff_us[] = { 50000, 150000, 300000 };
-    NTSTATUS status = STATUS_UNSUCCESSFUL;
-    unsigned int i;
-
-    for (i = 0; i < ARRAY_SIZE(backoff_us) + 1; i++)
-    {
-        status = xsts_token_once( args );
-        if (status == STATUS_SUCCESS || status == STATUS_LOGON_FAILURE) return status;
-        if (i < ARRAY_SIZE(backoff_us))
-        {
-            TRACE( "token request failed (%#x); retrying.\n", (unsigned int)status );
-            usleep( backoff_us[i] );
-        }
-    }
-    return status;
-}
-
-/* A dedicated request keeps account authorization and HTTP inside the service.
- * The XML request uses base64 for custom text (XML normalizes controls). The
- * response frame contains only the validated ASCII JWT, or is empty on error.
- * Old services reply with an unknown-message frame; reject it, never fall back
- * to a successful empty token. Bound the entire IPC exchange, including reads. */
+/* Every exchange with the service is bounded by one deadline, reads, writes and
+ * the connect included. A title calls into here from threads it expects to
+ * come back -- a service that is stalled, or busy waiting on a keyring prompt,
+ * must cost it a timeout, not the thread. */
 static long long license_now_ms( void )
 {
     struct timespec ts;
@@ -393,23 +164,266 @@ static BOOL license_io( int fd, void *buffer, SIZE_T size, BOOL writing, long lo
     return TRUE;
 }
 
+/* The socket is non-blocking and close-on-exec from the start: a process the
+ * title starts while a request is open (a helper, a crash reporter) must not
+ * inherit the connection and keep it alive in the service. A listener whose
+ * backlog is full answers EAGAIN rather than queueing the connect, so that is
+ * retried until the deadline instead of waited on for ever. */
+static int connect_service( long long deadline )
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    const char *runtime_dir = xodus_runtime_dir();
+    struct pollfd pollfd;
+    socklen_t error_size;
+    long long left;
+    int fd, error;
+
+    if (!runtime_dir || !runtime_dir[0])
+    {
+        WARN( "XDG_RUNTIME_DIR is not set; cannot reach xodus-service.\n" );
+        errno = ENOENT;
+        return -1;
+    }
+    if (snprintf( addr.sun_path, sizeof(addr.sun_path), "%s/xodus.sock", runtime_dir ) >= (int)sizeof(addr.sun_path))
+    {
+        WARN( "socket path does not fit.\n" );
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if ((fd = socket( AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0 )) < 0) return -1;
+    for (;;)
+    {
+        if (!connect( fd, (struct sockaddr *)&addr, sizeof(addr) )) return fd;
+        if (errno == EINTR) continue;
+        left = deadline - license_now_ms();
+        if (errno == EAGAIN && left > 0)
+        {
+            usleep( left > 10 ? 10000 : left * 1000 );
+            continue;
+        }
+        if (errno == EINPROGRESS && left > 0)
+        {
+            pollfd.fd = fd; pollfd.events = POLLOUT; pollfd.revents = 0;
+            if (poll( &pollfd, 1, left ) <= 0) { error = ETIMEDOUT; break; }
+            error_size = sizeof(error);
+            if (getsockopt( fd, SOL_SOCKET, SO_ERROR, &error, &error_size )) error = errno;
+            if (!error) return fd;
+            break;
+        }
+        error = (errno == EAGAIN || errno == EINPROGRESS) ? ETIMEDOUT : errno;
+        break;
+    }
+    WARN( "xodus-service is not reachable on %s (%s); no Xbox Live sign-in.\n",
+          addr.sun_path, strerror( error ) );
+    close( fd );
+    errno = error;
+    return -1;
+}
+
+/* What a failed exchange means to the caller: out of time, or not there. */
+static NTSTATUS io_status( NTSTATUS fallback )
+{
+    return errno == ETIMEDOUT ? STATUS_IO_TIMEOUT : fallback;
+}
+
+/* Copy the text between <tag> and </tag> into out. The service's replies are
+ * small, flat and machine-generated, so a scan is enough and saves dragging an
+ * XML parser into the unix side. */
+static void extract_tag( const char *xml, const char *tag, char *out, size_t out_len )
+{
+    char open_tag[64], close_tag[64];
+    const char *start, *end;
+    size_t len;
+
+    out[0] = 0;
+    snprintf( open_tag, sizeof(open_tag), "<%s>", tag );
+    snprintf( close_tag, sizeof(close_tag), "</%s>", tag );
+
+    if (!(start = strstr( xml, open_tag ))) return;
+    start += strlen( open_tag );
+    if (!(end = strstr( start, close_tag ))) return;
+
+    len = end - start;
+    if (len >= out_len) len = out_len - 1;
+    memcpy( out, start, len );
+    out[len] = 0;
+}
+
+static NTSTATUS xsts_token_once( struct xsts_token_params *params, long long deadline )
+{
+    char *request = NULL, header[8], *body = NULL, *body_b64 = NULL;
+    unsigned int extended_size;
+    char *url_esc = NULL, *method_esc = NULL, *title_esc = NULL, *client_esc = NULL;
+    unsigned int magic, size = 0;
+    unsigned short type, len;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    char expiry[XGR_IDENTITY_MAX];
+    int fd, body_len;
+    size_t request_size;
+
+    params->token[0] = params->xuid[0] = params->gamertag[0] = params->signature[0] = 0;
+    params->expiry = 0;
+
+    if ((fd = connect_service( deadline )) < 0) return io_status( STATUS_NOT_FOUND );
+
+    /* The signature covers the body, so it has to travel with the ask; base64
+     * keeps arbitrary bytes safe inside the XML. */
+    if (params->body_size > 6 * 1024 * 1024)
+    { status = STATUS_INVALID_BUFFER_SIZE; goto done; }
+    if (params->body && params->body_size)
+    {
+        if (!(body_b64 = base64_encode( params->body, params->body_size ))) goto done;
+    }
+
+    if (!(url_esc = xml_escape( params->url )) ||
+        !(method_esc = xml_escape( params->method ? params->method : "GET" )) ||
+        !(title_esc = xml_escape( params->title_id ? params->title_id : "" )) ||
+        !(client_esc = xml_escape( params->title_client_id ? params->title_client_id : "" )))
+    { status = STATUS_NO_MEMORY; goto done; }
+
+    request_size = 512 + strlen( url_esc ) + strlen( method_esc ) +
+                   strlen( title_esc ) + strlen( client_esc ) +
+                   (body_b64 ? strlen( body_b64 ) : 0);
+    if (!(request = malloc( request_size ))) { status = STATUS_NO_MEMORY; goto done; }
+
+    /* RelyingParty stays empty on purpose: the service resolves it from the
+     * title-management endpoint list, which is authoritative and knows hosts
+     * this side does not. TitleId and MSAAppId, on the other hand, only this
+     * side can see -- they come out of the game's own MicrosoftGame.config. */
+    body_len = snprintf( request, request_size,
+                         "<XSTSTokenRequest><Url>%s</Url><RelyingParty></RelyingParty>"
+                         "<Method>%s</Method><TitleId>%s</TitleId>"
+                         "<TitleClientId>%s</TitleClientId>"
+                         "<BodyBase64>%s</BodyBase64>%s</XSTSTokenRequest>",
+                         url_esc, method_esc, title_esc, client_esc,
+                         body_b64 ? body_b64 : "",
+                         (params->flags & XGR_XSTS_FORCE_REFRESH) ? "<ForceRefresh>true</ForceRefresh>" : "" );
+    if (body_len < 0 || body_len >= (int)request_size) goto done;
+    if (body_len > 8 * 1024 * 1024)
+    { status = STATUS_INVALID_BUFFER_SIZE; goto done; }
+
+    magic = XODUS_XML_MAGIC;
+    type = XODUS_XSTS_TOKEN_REQUEST | (body_len > 0xffff ? 0x8000 : 0);
+    len = body_len > 0xffff ? 0xffff : body_len;
+    memcpy( header, &magic, 4 );
+    memcpy( header + 4, &type, 2 );
+    memcpy( header + 6, &len, 2 );
+
+    errno = 0;
+    if (!license_io( fd, header, sizeof(header), TRUE, deadline )) goto io_failed;
+    extended_size = body_len;
+    if (body_len > 0xffff && !license_io( fd, &extended_size, sizeof(extended_size), TRUE, deadline ))
+        goto io_failed;
+    if (!license_io( fd, request, body_len, TRUE, deadline )) goto io_failed;
+
+    if (!license_io( fd, header, sizeof(header), FALSE, deadline )) goto io_failed;
+    memcpy( &magic, header, 4 );
+    memcpy( &type, header + 4, 2 );
+    memcpy( &len, header + 6, 2 );
+    if (magic != XODUS_XML_MAGIC || type != XODUS_XSTS_TOKEN_REQUEST + 1)
+    {
+        WARN( "unexpected reply magic %#x.\n", magic );
+        goto done;
+    }
+    if (!len)
+    {
+        WARN( "xodus-service returned no token; the account may not be signed in.\n" );
+        status = STATUS_LOGON_FAILURE;
+        goto done;
+    }
+
+    size = len;
+    if (!(body = malloc( size + 1 ))) { status = STATUS_NO_MEMORY; goto done; }
+    if (!license_io( fd, body, size, FALSE, deadline )) goto io_failed;
+    body[size] = 0;
+
+    extract_tag( body, "Token", params->token, sizeof(params->token) );
+    extract_tag( body, "Xuid", params->xuid, sizeof(params->xuid) );
+    extract_tag( body, "Gamertag", params->gamertag, sizeof(params->gamertag) );
+    extract_tag( body, "Signature", params->signature, sizeof(params->signature) );
+    extract_tag( body, "Expiry", expiry, sizeof(expiry) );
+    params->expiry = atoll( expiry );
+
+    if (!params->token[0])
+    {
+        status = STATUS_LOGON_FAILURE;
+        goto done;
+    }
+
+    TRACE( "got a %zu-character token for %s (gamertag %s).\n",
+           strlen( params->token ), debugstr_a( params->url ), debugstr_a( params->gamertag ) );
+    status = STATUS_SUCCESS;
+    goto done;
+
+io_failed:
+    status = io_status( STATUS_UNSUCCESSFUL );
+done:
+    free( url_esc );
+    free( method_esc );
+    free( title_esc );
+    free( client_esc );
+    free( request );
+    free( body_b64 );
+    if (body)
+    {
+        /* The reply carries the bearer token; do not leave it in freed memory. */
+        memset( body, 0, size );
+        free( body );
+    }
+    close( fd );
+    return status;
+}
+
+/* Ask again after a transient failure. The service is a separate process, so a
+ * request can lose a race with it at startup -- and the caller here is usually
+ * resolving the signed-in account, where giving up once meant the title showed
+ * nobody signed in until it was restarted. A refused sign-in is not transient
+ * and is returned as it stands. */
+static NTSTATUS xsts_token( void *args )
+{
+    static const int backoff_ms[] = { 50, 150, 300 };
+    struct xsts_token_params *params = args;
+    long long deadline = license_now_ms() + (params->timeout_ms ? params->timeout_ms : XGR_XSTS_TIMEOUT_MS);
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    long long left;
+    unsigned int i;
+
+    /* Retries share the request's one deadline, and running out of it is final:
+     * a service that did not answer in time will not answer a second ask any
+     * sooner. */
+    for (i = 0; i < ARRAY_SIZE(backoff_ms) + 1; i++)
+    {
+        status = xsts_token_once( params, deadline );
+        if (status == STATUS_SUCCESS || status == STATUS_LOGON_FAILURE || status == STATUS_IO_TIMEOUT)
+            return status;
+        if (i < ARRAY_SIZE(backoff_ms))
+        {
+            left = deadline - license_now_ms();
+            if (left <= backoff_ms[i]) return STATUS_IO_TIMEOUT;
+            TRACE( "token request failed (%#x); retrying.\n", (unsigned int)status );
+            usleep( backoff_ms[i] * 1000 );
+        }
+    }
+    return status;
+}
+
+/* A dedicated request keeps account authorization and HTTP inside the service.
+ * The XML request uses base64 for custom text (XML normalizes controls). The
+ * response frame contains only the validated ASCII JWT, or is empty on error.
+ * Old services reply with an unknown-message frame; reject it, never fall back
+ * to a successful empty token. Bound the entire IPC exchange, including reads. */
 static NTSTATUS license_token( void *args )
 {
     struct license_token_params *params = args;
-    const char *runtime_dir = xodus_runtime_dir();
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
     char *custom = NULL, *request = NULL, *parent = NULL, *title = NULL, *client = NULL, *id;
     unsigned char header[8];
     unsigned int size, i;
-    int fd = -1, n, used, error;
-    socklen_t error_size = sizeof(error);
-    struct pollfd pollfd;
+    int fd = -1, n, used;
     long long deadline = license_now_ms() + 50000;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
 
     params->token[0] = 0;
-    if (!runtime_dir || snprintf( addr.sun_path, sizeof(addr.sun_path), "%s/xodus.sock", runtime_dir ) >= (int)sizeof(addr.sun_path))
-        return STATUS_NOT_FOUND;
     if (!(custom = base64_encode( params->custom, strlen(params->custom) )) ||
         !(parent = xml_escape( params->store_id )) || !(title = xml_escape( params->title_id )) ||
         !(client = xml_escape( params->title_client_id )) || !(request = malloc( 65536 )))
@@ -430,14 +444,7 @@ static NTSTATUS license_token( void *args )
     n = snprintf( request + used, 65536 - used, "</ProductIds></LicenseTokenRequest>" );
     if (n < 0 || n >= 65536 - used) goto done;
     used += n;
-    if ((fd = socket( AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0 )) < 0) goto done;
-    if (connect( fd, (struct sockaddr *)&addr, sizeof(addr) ))
-    {
-        if (errno != EINPROGRESS) goto done;
-        pollfd.fd = fd; pollfd.events = POLLOUT; pollfd.revents = 0;
-        if (poll( &pollfd, 1, 50000 ) <= 0 || getsockopt( fd, SOL_SOCKET, SO_ERROR, &error, &error_size ) || error)
-            goto done;
-    }
+    if ((fd = connect_service( deadline )) < 0) { status = io_status( STATUS_NOT_FOUND ); goto done; }
     header[0] = 'X'; header[1] = 'S'; header[2] = 'D'; header[3] = 'X';
     header[4] = 7; header[5] = 0;
     header[6] = used & 0xff; header[7] = used >> 8;
@@ -477,8 +484,7 @@ static NTSTATUS store_catalog( void *args )
     params->response_size = 0;
     if (!params->request_size || params->request_size > 24000 || !params->response)
         return STATUS_INVALID_PARAMETER;
-    if ((fd = connect_service()) < 0) return STATUS_NOT_FOUND;
-    fcntl(fd,F_SETFL,fcntl(fd,F_GETFL) | O_NONBLOCK);
+    if ((fd = connect_service( deadline )) < 0) return io_status( STATUS_NOT_FOUND );
     errno = 0;
     header[0] = 'C'; header[1] = 'S'; header[2] = 'D'; header[3] = 'X';
     size = params->request_size;
@@ -509,12 +515,17 @@ static NTSTATUS account_roles( void *args )
     int fd;
 
     memset( params, 0, sizeof(*params) );
-    if ((fd = connect_service()) < 0) return STATUS_NOT_FOUND;
-    fcntl( fd, F_SETFL, fcntl(fd,F_GETFL) | O_NONBLOCK );
+    if ((fd = connect_service( deadline )) < 0) return io_status( STATUS_NOT_FOUND );
     errno = 0;
     if (!license_io(fd,request,sizeof(request),TRUE,deadline) ||
-        !license_io(fd,response,sizeof(response),FALSE,deadline)) goto done;
-    if (response[0] != 1 || response[1] > 1 || response[2] > 1 || response[3] > 1) goto done;
+        !license_io(fd,response,sizeof(response),FALSE,deadline))
+    { status = io_status( STATUS_UNSUCCESSFUL ); goto done; }
+    if (response[0] != 1 || response[1] > 1 || response[2] > 1 || response[3] > 1)
+    {
+        WARN( "unsupported account roles reply (version %u).\n", response[0] );
+        status = STATUS_NOT_SUPPORTED;
+        goto done;
+    }
     params->store_signed_in = response[1];
     params->player_signed_in = response[2];
     params->same_store_user = response[1] && response[2] && response[3];
@@ -535,17 +546,21 @@ static NTSTATUS store_entitlement( void *args )
 
     params->active = 0;
     if (strnlen(params->store_id,sizeof(params->store_id)) != 12) return STATUS_INVALID_PARAMETER;
-    if ((fd = connect_service()) < 0) return STATUS_NOT_FOUND;
-    fcntl( fd,F_SETFL,fcntl(fd,F_GETFL) | O_NONBLOCK );
+    if ((fd = connect_service( deadline )) < 0) return io_status( STATUS_NOT_FOUND );
     errno = 0;
     if (!license_io(fd,request,sizeof(request),TRUE,deadline) ||
         !license_io(fd,params->store_id,12,TRUE,deadline) ||
-        !license_io(fd,response,sizeof(response),FALSE,deadline)) goto done;
-    if (response[0] != 1 || response[1] > 1) goto done;
+        !license_io(fd,response,sizeof(response),FALSE,deadline))
+    { status = io_status( STATUS_UNSUCCESSFUL ); goto done; }
+    if (response[0] != 1 || response[1] > 1)
+    {
+        WARN( "unsupported entitlement reply (version %u).\n", response[0] );
+        status = STATUS_NOT_SUPPORTED;
+        goto done;
+    }
     params->active = response[1];
     status = STATUS_SUCCESS;
 done:
-    if (status && errno == ETIMEDOUT) status = STATUS_IO_TIMEOUT;
     close(fd);
     return status;
 }

@@ -161,7 +161,15 @@ static inline BOOL xgr_async_completed( const XAsyncBlock *async, HRESULT *hr, v
 
 /* Account-scoped change notifications (inactive in legacy runtime mode). */
 enum xgr_role_watch_kind { XGR_ROLE_WATCH_USER, XGR_ROLE_WATCH_GAME, XGR_ROLE_WATCH_PACKAGE };
+/* `initial` is the state the caller last reported (0 or 1), or -1 when it is
+ * not known yet and the first definitive answer becomes the baseline. */
 HRESULT xgr_role_watch_register(enum xgr_role_watch_kind, void *, XTaskQueueHandle, void *,
-    XUserChangeEventCallback *, XStoreGameLicenseChangedCallback *, BOOL, XTaskQueueRegistrationToken *);
+    XUserChangeEventCallback *, XStoreGameLicenseChangedCallback *, int, XTaskQueueRegistrationToken *);
 BOOLEAN xgr_role_watch_unregister(enum xgr_role_watch_kind, void *, XTaskQueueRegistrationToken, BOOLEAN);
 void xgr_role_watch_close(enum xgr_role_watch_kind, void *);
+/* The Store account's entitlement to the running game as last answered by the
+ * service, kept off the title's threads (xuser.c). FALSE while nothing
+ * definitive is known. Store requests that ask the service themselves feed
+ * their answer back with the unix call's status. */
+BOOL xgr_role_entitlement( UINT32 *active );
+void xgr_role_entitlement_store( LONG status /* NTSTATUS */, UINT32 active );

@@ -44,6 +44,18 @@
 
 #define XGR_SIGNATURE_MAX 512
 
+/* Token request flags. FORCE_REFRESH asks the service to mint a new token
+ * rather than answer from its cache -- what a title means by
+ * XUserGetTokenAndSignatureOptions_ForceRefresh after a 401. It travels as
+ * <ForceRefresh>true</ForceRefresh> in the request, and only when set, so a
+ * service that does not know the element sees the request it always did. */
+#define XGR_XSTS_FORCE_REFRESH 0x1
+
+/* How long a whole token exchange may take, retries included, when the caller
+ * does not say. The service allows itself 30 s per XSTS request and may retry
+ * once without the title claim, so this sits just above that. */
+#define XGR_XSTS_TIMEOUT_MS 65000
+
 struct xsts_token_params
 {
     const char *url;                        /* in:  the URL the title will call */
@@ -52,6 +64,8 @@ struct xsts_token_params
     ULONG body_size;                        /* in */
     const char *title_id;                   /* in:  decimal TitleId, may be NULL */
     const char *title_client_id;            /* in:  MSAAppId, may be NULL */
+    UINT32 flags;                           /* in:  XGR_XSTS_* */
+    UINT32 timeout_ms;                      /* in:  0 means XGR_XSTS_TIMEOUT_MS */
     char token[XGR_TOKEN_MAX];              /* out: "XBL3.0 x=<uhs>;<token>" */
     char signature[XGR_SIGNATURE_MAX];      /* out: Signature header, may be empty */
     char xuid[XGR_IDENTITY_MAX];            /* out: decimal XUID, may be empty */
@@ -78,6 +92,11 @@ struct store_catalog_params
     ULONG response_size;
 };
 
+/* account_roles and store_entitlement answer STATUS_SUCCESS with a definitive
+ * state, STATUS_NOT_SUPPORTED when the service replied in a version this side
+ * cannot read (also definitive: nothing can be verified, so callers fail
+ * closed), and any other status when the exchange itself failed -- which says
+ * nothing about the account and must not be read as a sign-out. */
 struct account_roles_params
 {
     UINT32 store_signed_in, player_signed_in, same_store_user;

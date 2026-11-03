@@ -19,6 +19,8 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
+#include "ntstatus.h"
+#define WIN32_NO_STATUS
 #include "private.h"
 #include "unixlib.h"
 
@@ -155,46 +157,285 @@ UINT64 xgr_local_xuid( void )
  * An Xbox Live token carries the account it was issued to, so one request
  * against the Xbox Live relying party yields the XUID and gamertag to report
  * instead of a placeholder -- without which a title has no idea who is playing
- * and shows nobody as signed in. Resolved off whichever thread asks first, and
- * only latched once it succeeds: a single transient failure used to leave the
- * process offline for the rest of its life, which showed up as being signed out
- * until the title was restarted. */
+ * and shows nobody as signed in. Only latched once it succeeds: a single
+ * transient failure used to leave the process offline for the rest of its life,
+ * which showed up as being signed out until the title was restarted.
+ *
+ * The request runs on the thread pool, never on the thread asking. XUserGetId
+ * and XUserGetGamertag are calls a title makes from its main thread and expects
+ * back at once; doing the service round trip inline cost half a second per
+ * call with the service down, and the whole frame with it stalled. So the
+ * resolution starts at XUserAddAsync, the very first question waits a bounded
+ * time for it -- keeping the XUID a title reads at startup the real one in the
+ * ordinary case -- and every later question takes what is known. A failure is
+ * remembered for a while, so a title polling the getters does not turn into a
+ * stream of requests at a service that is not there. */
+#define IDENTITY_FIRST_WAIT_MS 15000
+#define IDENTITY_RETRY_MS      10000
+
 static struct
 {
     UINT64 xuid;
     char gamertag[XGR_IDENTITY_MAX];
+    BOOL resolved, resolving, attempted, waited;
+    ULONGLONG retry_at;
 } live_identity;
 
-static INIT_ONCE live_identity_once = INIT_ONCE_STATIC_INIT;
+static SRWLOCK live_identity_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE live_identity_done = CONDITION_VARIABLE_INIT;
 
-static BOOL WINAPI resolve_live_identity( INIT_ONCE *once, void *param, void **ctx )
+/* Keep this module mapped while a thread of ours may be running in it. */
+static void pin_module( void )
 {
-    struct xsts_token_params params = {0};
+    HMODULE module;
+    GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                        (const WCHAR *)pin_module, &module );
+}
+
+static void CALLBACK resolve_live_identity( TP_CALLBACK_INSTANCE *instance, void *context )
+{
+    struct xsts_token_params *params;
+    UINT64 xuid = 0;
+    NTSTATUS status = STATUS_NO_MEMORY;
     const char *p;
 
     /* Any Xbox Live relying party returns the display claims; this one is the
      * canonical choice and is what the account's own services use. */
-    params.url = "https://xboxlive.com";
-    if (XGR_UNIX_CALL( xsts_token, &params ))
+    if ((params = calloc( 1, sizeof(*params) )))
     {
-        /* FALSE leaves the once uninitialised, so the next caller tries again
-         * rather than the whole process staying offline over one failure. */
-        WARN( "no Xbox Live identity yet; will try again on the next request.\n" );
-        return FALSE;
+        params->url = "https://xboxlive.com";
+        status = XGR_UNIX_CALL( xsts_token, params );
     }
 
-    for (p = params.xuid; *p >= '0' && *p <= '9'; p++)
-        live_identity.xuid = live_identity.xuid * 10 + (*p - '0');
-    memcpy( live_identity.gamertag, params.gamertag, sizeof(live_identity.gamertag) );
-    live_identity.gamertag[sizeof(live_identity.gamertag) - 1] = 0;
+    AcquireSRWLockExclusive( &live_identity_lock );
+    if (!status)
+    {
+        for (p = params->xuid; *p >= '0' && *p <= '9'; p++)
+            xuid = xuid * 10 + (*p - '0');
+        live_identity.xuid = xuid;
+        memcpy( live_identity.gamertag, params->gamertag, sizeof(live_identity.gamertag) );
+        live_identity.gamertag[sizeof(live_identity.gamertag) - 1] = 0;
+        live_identity.resolved = TRUE;
+        TRACE( "signed in as %s (xuid %I64u).\n", debugstr_a( live_identity.gamertag ), live_identity.xuid );
+    }
+    else
+    {
+        live_identity.retry_at = GetTickCount64() + IDENTITY_RETRY_MS;
+        WARN( "no Xbox Live identity yet (%#lx); will try again in %u s.\n", status, IDENTITY_RETRY_MS / 1000 );
+    }
+    live_identity.resolving = FALSE;
+    live_identity.attempted = TRUE;
+    ReleaseSRWLockExclusive( &live_identity_lock );
+    WakeAllConditionVariable( &live_identity_done );
 
-    TRACE( "signed in as %s (xuid %I64u).\n", debugstr_a( live_identity.gamertag ), live_identity.xuid );
+    if (params)
+    {
+        SecureZeroMemory( params->token, sizeof(params->token) );
+        SecureZeroMemory( params->signature, sizeof(params->signature) );
+        free( params );
+    }
+}
+
+/* Caller holds live_identity_lock exclusively. */
+static void start_live_identity_locked( void )
+{
+    if (live_identity.resolved || live_identity.resolving || GetTickCount64() < live_identity.retry_at) return;
+    pin_module();
+    live_identity.resolving = TRUE;
+    if (!TrySubmitThreadpoolCallback( resolve_live_identity, NULL, NULL ))
+    {
+        live_identity.resolving = FALSE;
+        live_identity.retry_at = GetTickCount64() + IDENTITY_RETRY_MS;
+    }
+}
+
+static void start_live_identity( void )
+{
+    AcquireSRWLockExclusive( &live_identity_lock );
+    start_live_identity_locked();
+    ReleaseSRWLockExclusive( &live_identity_lock );
+}
+
+/* What is known about the signed-in identity right now. */
+static BOOL get_live_identity( UINT64 *xuid, char *gamertag, SIZE_T gamertag_size )
+{
+    ULONGLONG deadline, now;
+    BOOL resolved;
+
+    AcquireSRWLockExclusive( &live_identity_lock );
+    start_live_identity_locked();
+    if (!live_identity.attempted && !live_identity.waited)
+    {
+        deadline = GetTickCount64() + IDENTITY_FIRST_WAIT_MS;
+        while (live_identity.resolving && (now = GetTickCount64()) < deadline)
+            SleepConditionVariableSRW( &live_identity_done, &live_identity_lock, deadline - now, 0 );
+        /* Whatever happened, nobody else waits: a stalled service costs the
+         * first question its bounded wait and no more. */
+        live_identity.waited = TRUE;
+    }
+    resolved = live_identity.resolved;
+    if (xuid) *xuid = live_identity.xuid;
+    if (gamertag) lstrcpynA( gamertag, live_identity.gamertag, gamertag_size );
+    ReleaseSRWLockExclusive( &live_identity_lock );
+    return resolved;
+}
+
+/* Account-roles state (XGR_ACCOUNT_ROLES_V1).
+ *
+ * Who is signed in to the Store and Player roles, and whether the Store account
+ * holds the running game, live in the service. Asking it is a socket round
+ * trip -- and for the entitlement, about once a minute, a licensing request of
+ * up to 25 s. None of that may happen on a title's thread or queue:
+ * XUserGetState, XUserIsStoreUser and XStoreIsLicenseValid are cheap local
+ * checks on Windows that titles call every frame, and the change notifications
+ * used to poll on the title's own queue, holding up everything queued behind
+ * them (in strict manual mode, the title's dispatch thread itself).
+ *
+ * So one private thread per source keeps the last definitive answer here, and
+ * the title-facing calls read it. A failed exchange -- the service restarting,
+ * a timeout -- is not an answer: it leaves the last state alone, where it used
+ * to read as a sign-out or a lost licence, and a licence handle never recovered
+ * from it. An answer in a protocol version this side cannot read is
+ * definitive, and fails closed. A source is polled while something watches it
+ * or a title asked about it in the last half minute. */
+enum role_source { ROLE_SOURCE_ACCOUNTS, ROLE_SOURCE_ENTITLEMENT, ROLE_SOURCE_COUNT };
+#define ROLE_POLL_MS   1000
+#define ROLE_DEMAND_MS 30000
+
+static struct role_source_state
+{
+    BOOL known, seeded, started;
+    struct account_roles_params roles;  /* ROLE_SOURCE_ACCOUNTS */
+    UINT32 active;                      /* ROLE_SOURCE_ENTITLEMENT */
+    ULONGLONG wanted_until;
+    LONG watchers;
+    HANDLE wake;
+} role_state[ROLE_SOURCE_COUNT];
+static SRWLOCK role_state_lock = SRWLOCK_INIT;
+
+static void role_watches_update( enum role_source source );
+
+/* Keep what an exchange said, if it said anything. */
+static BOOL role_state_store( enum role_source source, NTSTATUS status,
+                              const struct account_roles_params *roles, UINT32 active )
+{
+    struct role_source_state *state = &role_state[source];
+
+    if (status && status != STATUS_NOT_SUPPORTED)
+    {
+        TRACE( "role source %u unavailable (%#lx); keeping the last state.\n", source, status );
+        return FALSE;
+    }
+    AcquireSRWLockExclusive( &role_state_lock );
+    state->known = TRUE;
+    memset( &state->roles, 0, sizeof(state->roles) );
+    state->active = 0;
+    if (!status && source == ROLE_SOURCE_ACCOUNTS) state->roles = *roles;
+    else if (!status) state->active = active;
+    ReleaseSRWLockExclusive( &role_state_lock );
     return TRUE;
 }
 
-static void ensure_live_identity( void )
+static NTSTATUS role_state_fetch( enum role_source source )
 {
-    InitOnceExecuteOnce( &live_identity_once, resolve_live_identity, NULL, NULL );
+    struct store_entitlement_params entitlement = {{0}};
+    struct account_roles_params roles = {0};
+    NTSTATUS status;
+
+    if (source == ROLE_SOURCE_ACCOUNTS) status = XGR_UNIX_CALL( account_roles, &roles );
+    else if (!xgr_config_element( "StoreId", entitlement.store_id, sizeof(entitlement.store_id) ))
+        return STATUS_NOT_FOUND;
+    else status = XGR_UNIX_CALL( store_entitlement, &entitlement );
+    role_state_store( source, status, &roles, entitlement.active );
+    return status;
+}
+
+static BOOL role_state_peek( enum role_source source, struct account_roles_params *roles, UINT32 *active )
+{
+    BOOL known;
+
+    AcquireSRWLockShared( &role_state_lock );
+    known = role_state[source].known;
+    if (roles) *roles = role_state[source].roles;
+    if (active) *active = role_state[source].active;
+    ReleaseSRWLockShared( &role_state_lock );
+    return known;
+}
+
+static DWORD WINAPI role_poller( void *arg )
+{
+    enum role_source source = (ULONG_PTR)arg;
+    struct role_source_state *state = &role_state[source];
+    BOOL demand;
+
+    for (;;)
+    {
+        AcquireSRWLockShared( &role_state_lock );
+        demand = state->watchers > 0 || GetTickCount64() < state->wanted_until;
+        ReleaseSRWLockShared( &role_state_lock );
+        if (demand)
+        {
+            role_state_fetch( source );
+            role_watches_update( source );
+        }
+        WaitForSingleObject( state->wake, demand ? ROLE_POLL_MS : INFINITE );
+    }
+    return 0;
+}
+
+/* Note that a title cares about a source -- `watchers` adds or drops a
+ * standing interest -- and make sure something is polling it. */
+static void role_source_want( enum role_source source, LONG watchers )
+{
+    struct role_source_state *state = &role_state[source];
+    ULONGLONG now = GetTickCount64();
+    BOOL idle, start = FALSE;
+    HANDLE thread;
+
+    AcquireSRWLockExclusive( &role_state_lock );
+    idle = state->watchers <= 0 && now >= state->wanted_until;
+    state->watchers += watchers;
+    if (watchers >= 0) state->wanted_until = now + ROLE_DEMAND_MS;
+    if (!state->started && (state->wake = CreateEventW( NULL, FALSE, FALSE, NULL )))
+        start = state->started = TRUE;
+    ReleaseSRWLockExclusive( &role_state_lock );
+
+    if (start)
+    {
+        pin_module();
+        if ((thread = CreateThread( NULL, 0, role_poller, (void *)(ULONG_PTR)source, 0, NULL )))
+            CloseHandle( thread );
+        else ERR( "could not start the role poller: %lu.\n", GetLastError() );
+    }
+    else if (idle && watchers >= 0 && state->wake) SetEvent( state->wake );
+}
+
+/* The last definitive answer, if there has been one. With `seed`, a source
+ * that has never answered is asked once, synchronously and bounded, so the
+ * first question of a process does not have to wait for a poll. */
+static BOOL role_state_get( enum role_source source, BOOL seed, struct account_roles_params *roles, UINT32 *active )
+{
+    BOOL ask;
+
+    role_source_want( source, 0 );
+    if (role_state_peek( source, roles, active )) return TRUE;
+    if (!seed) return FALSE;
+    AcquireSRWLockExclusive( &role_state_lock );
+    ask = !role_state[source].seeded;
+    role_state[source].seeded = TRUE;
+    ReleaseSRWLockExclusive( &role_state_lock );
+    if (ask) role_state_fetch( source );
+    return role_state_peek( source, roles, active );
+}
+
+BOOL xgr_role_entitlement( UINT32 *active )
+{
+    return role_state_get( ROLE_SOURCE_ENTITLEMENT, FALSE, NULL, active );
+}
+
+void xgr_role_entitlement_store( NTSTATUS status, UINT32 active )
+{
+    role_state_store( ROLE_SOURCE_ENTITLEMENT, status, NULL, active );
 }
 
 static HRESULT WINAPI x_user_XUserDuplicateHandle( IXUserImpl6 *iface, XUserHandle handle, XUserHandle *duplicatedHandle )
@@ -236,8 +477,17 @@ static HRESULT WINAPI x_user_XUserAddAsync( IXUserImpl6 *iface, XUserAddOptions 
     TRACE( "iface %p, options %d, async %p.\n", iface, options, async );
 
     if (!async) return E_INVALIDARG;
-    if (account_roles_enabled() && (XGR_UNIX_CALL(account_roles,&roles) || !roles.player_signed_in))
-        return HRESULT_FROM_WIN32(ERROR_NO_SUCH_LOGON_SESSION);
+    if (account_roles_enabled())
+    {
+        /* Asked afresh, since this is where a title learns whether anyone is
+         * signed in at all (bounded by the unix call's own deadline); a
+         * failed exchange falls back to the last answer there was. */
+        role_state_fetch( ROLE_SOURCE_ACCOUNTS );
+        if (!role_state_get( ROLE_SOURCE_ACCOUNTS, FALSE, &roles, NULL ) || !roles.player_signed_in)
+            return HRESULT_FROM_WIN32(ERROR_NO_SUCH_LOGON_SESSION);
+    }
+    /* The identity is wanted next; get it going while the title carries on. */
+    start_live_identity();
 
     /* Nothing to negotiate for a local user, so complete before returning. */
     TRACE( "user handle async result: %Iu bytes.\n", sizeof(local_user_result) );
@@ -283,6 +533,8 @@ static HRESULT WINAPI x_user_XUserFindUserByLocalId( IXUserImpl6 *iface, XUserLo
 
 static HRESULT WINAPI x_user_XUserGetId( IXUserImpl6 *iface, XUserHandle user, UINT64 *userId )
 {
+    UINT64 xuid = 0;
+
     TRACE( "iface %p, user %p, userId %p.\n", iface, user, userId );
 
     if (!is_local_user( user ) || !userId) return E_INVALIDARG;
@@ -290,9 +542,8 @@ static HRESULT WINAPI x_user_XUserGetId( IXUserImpl6 *iface, XUserHandle user, U
     /* Prefer the XUID the Xbox Live token was issued to; XGR_XUID (the one the
      * user's Windows install saved under) remains the offline fallback so
      * on-disk save layouts still line up. */
-    ensure_live_identity();
-    if (live_identity.xuid) *userId = live_identity.xuid;
-    else *userId = local_user.id ? local_user.id : xgr_local_xuid();
+    if (!get_live_identity( &xuid, NULL, 0 ) || !xuid) xuid = local_user.id ? local_user.id : xgr_local_xuid();
+    *userId = xuid;
     return S_OK;
 }
 
@@ -319,8 +570,10 @@ static HRESULT WINAPI x_user_XUserGetState( IXUserImpl6 *iface, XUserHandle user
     TRACE( "iface %p, user %p, state %p.\n", iface, user, state );
 
     if (!is_local_user( user ) || !state) return E_INVALIDARG;
+    /* The handle was issued signed in; only a definitive answer changes that. */
     *state = XUserState_SignedIn;
-    if (account_roles_enabled() && (XGR_UNIX_CALL(account_roles,&roles) || !roles.player_signed_in))
+    if (account_roles_enabled() && role_state_get( ROLE_SOURCE_ACCOUNTS, TRUE, &roles, NULL ) &&
+        !roles.player_signed_in)
         *state = XUserState_SignedOut;
     return S_OK;
 }
@@ -387,118 +640,191 @@ static HRESULT WINAPI x_user_XUserResolvePrivilegeWithUiResult( IXUserImpl6 *ifa
  * E_NOTIMPL: callers read that as an unexpected fault and retry for ever
  * (Minecraft spun on its PlayFab sign-in tens of thousands of times).
  *
- * The result is reported through the async block, since the operation itself
- * starts fine and it is the outcome that may fail. The payload is one
- * allocation laid out as the caller expects to receive it: the
- * XUserGetTokenAndSignatureData header followed by the token bytes. */
-static HRESULT token_and_signature_async( XAsyncBlock *async, const char *method, const char *url,
-                                          SIZE_T body_size, const void *body )
+ * The request is an XAsyncBegin operation. The *Async call copies what it
+ * needs and returns; the round trip to the service is the operation's DoWork,
+ * scheduled on the caller's queue like any other async work, never done on the
+ * calling thread. The provider owns the result until the caller takes it, and
+ * Cleanup releases it. It used to be handed to the block and never freed -- a
+ * few KB, bearer token included, left behind for every Xbox Live call a title
+ * made. As with every provider-driven operation, taking the result consumes
+ * it. The narrow and UTF-16 entry points lay the result out differently, so
+ * each has its own identity and the size reported is the one its Result
+ * function will write. */
+struct token_request
 {
-    struct xsts_token_params params = {0};
-    XUserGetTokenAndSignatureData *data;
+    struct xsts_token_params params;
+    char *url, *method;
+    void *body;
+    BOOL wide;
     char title_id[64], title_client_id[64];
-    SIZE_T token_len, sig_len, size;
-    char *token_copy, *sig_copy;
+    SIZE_T token_len, signature_len;   /* UTF-8, without terminators */
+    int token_count, signature_count;  /* UTF-16, with terminators */
+};
+
+static const char token_identity, token_utf16_identity;
+
+static void token_request_free( struct token_request *req )
+{
+    SecureZeroMemory( req->params.token, sizeof(req->params.token) );
+    SecureZeroMemory( req->params.signature, sizeof(req->params.signature) );
+    free( req->url );
+    free( req->method );
+    free( req->body );
+    free( req );
+}
+
+static SIZE_T token_result_size( const struct token_request *req )
+{
+    if (req->wide)
+        return sizeof(XUserGetTokenAndSignatureUtf16Data) + (req->token_count + req->signature_count) * sizeof(WCHAR);
+    return sizeof(XUserGetTokenAndSignatureData) + req->token_len + 1 + (req->signature_len ? req->signature_len + 1 : 0);
+}
+
+static void token_fill_result( const struct token_request *req, void *buffer )
+{
+    if (req->wide)
+    {
+        XUserGetTokenAndSignatureUtf16Data *wide = buffer;
+        WCHAR *token = (WCHAR *)(wide + 1), *signature = req->signature_count ? token + req->token_count : NULL;
+
+        MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.token, -1, token, req->token_count );
+        if (signature)
+            MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.signature, -1, signature, req->signature_count );
+        wide->tokenCount = req->token_count * sizeof(WCHAR);
+        wide->signatureCount = req->signature_count * sizeof(WCHAR);
+        wide->token = token;
+        wide->signature = signature;
+    }
+    else
+    {
+        XUserGetTokenAndSignatureData *data = buffer;
+        char *token = (char *)(data + 1), *signature = token + req->token_len + 1;
+
+        memcpy( token, req->params.token, req->token_len + 1 );
+        data->tokenSize = req->token_len + 1;
+        data->token = token;
+        data->signatureSize = 0;
+        data->signature = NULL;
+        if (req->signature_len)
+        {
+            memcpy( signature, req->params.signature, req->signature_len + 1 );
+            data->signatureSize = req->signature_len + 1;
+            data->signature = signature;
+        }
+    }
+}
+
+static HRESULT CALLBACK token_provider( XAsyncOp op, const XAsyncProviderData *data )
+{
+    struct token_request *req = data->context;
+    HRESULT hr = S_OK;
+
+    switch (op)
+    {
+    case XAsyncOp_Begin:
+        return IXThreadingImpl_XAsyncSchedule( x_threading_impl, data->async, 0 );
+    case XAsyncOp_DoWork:
+        if (XGR_UNIX_CALL( xsts_token, &req->params )) hr = E_GAMEUSER_NO_AUTH_USER;
+        else
+        {
+            req->token_len = strlen( req->params.token );
+            req->signature_len = strlen( req->params.signature );
+            if (req->wide &&
+                (!(req->token_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.token, -1, NULL, 0 )) ||
+                 (req->signature_len &&
+                  !(req->signature_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, req->params.signature, -1, NULL, 0 )))))
+                hr = HRESULT_FROM_WIN32( GetLastError() );
+            else
+                TRACE( "issued a token for %s %s%s.\n", debugstr_a( req->method ), debugstr_a( req->url ),
+                       req->signature_len ? " (signed)" : "" );
+        }
+        /* Completion may release the context on another thread. */
+        IXThreadingImpl_XAsyncComplete( x_threading_impl, data->async, hr, SUCCEEDED(hr) ? token_result_size( req ) : 0 );
+        return E_PENDING;
+    case XAsyncOp_GetResult:
+        token_fill_result( req, data->buffer );
+        return S_OK;
+    case XAsyncOp_Cleanup:
+        token_request_free( req );
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
+static HRESULT token_and_signature_async( XAsyncBlock *async, XUserGetTokenAndSignatureOptions options,
+                                          const char *method, const char *url,
+                                          SIZE_T body_size, const void *body, BOOL wide )
+{
+    struct token_request *req;
+    HRESULT hr;
 
     if (!async) return E_INVALIDARG;
+    if (!(req = calloc( 1, sizeof(*req) ))) return E_OUTOFMEMORY;
+    req->wide = wide;
 
     /* Most Xbox Live endpoints carry a signature policy, and a signature covers
      * this request's own method, path and body -- so they all have to go with
-     * the ask rather than being cached alongside the token. */
-    params.url = url;
-    params.method = method;
-    params.body = body;
-    params.body_size = body_size;
+     * the ask rather than being cached alongside the token. The caller's
+     * buffers are only promised for the length of this call, so they are
+     * copied; a body over the service's limit is not, and the unixlib refuses
+     * it by its size. */
+    if (!body) body_size = 0;
+    if (!(req->url = strdup( url ? url : "" )) || !(req->method = strdup( method ? method : "GET" )) ||
+        (body_size && body_size <= 6 * 1024 * 1024 && !(req->body = malloc( body_size ))))
+    {
+        token_request_free( req );
+        return E_OUTOFMEMORY;
+    }
+    if (req->body) memcpy( req->body, body, body_size );
+    req->params.url = req->url;
+    req->params.method = req->method;
+    req->params.body = req->body;
+    req->params.body_size = body_size;
+    /* A title asks for a fresh token after a service refused the last one;
+     * answering from the service's cache would hand back the refused token. */
+    if (options & XUserGetTokenAndSignatureOptions_ForceRefresh) req->params.flags |= XGR_XSTS_FORCE_REFRESH;
 
     /* Which title is asking. Xbox puts it in the token as a claim, and the
      * services that scope by title refuse a token claiming the wrong one --
      * loudly enough (403) to look like a broken sign-in rather than a wrong
      * claim, which is what makes this worth carrying on every request. */
-    xgr_title_identity( title_id, sizeof(title_id), title_client_id, sizeof(title_client_id) );
-    params.title_id = title_id;
-    params.title_client_id = title_client_id;
-    if (!title_id[0])
+    xgr_title_identity( req->title_id, sizeof(req->title_id), req->title_client_id, sizeof(req->title_client_id) );
+    req->params.title_id = req->title_id;
+    req->params.title_client_id = req->title_client_id;
+    if (!req->title_id[0])
         WARN( "MicrosoftGame.config has no TitleId; the token request cannot identify its title.\n" );
-    else if (!title_client_id[0])
-        TRACE( "requesting Windows title authentication for %s (no MSAAppId).\n", title_id );
-    if (XGR_UNIX_CALL( xsts_token, &params ))
-    {
-        xgr_async_complete( async, E_GAMEUSER_NO_AUTH_USER, NULL );
-        return S_OK;
-    }
+    else if (!req->title_client_id[0])
+        TRACE( "requesting Windows title authentication for %s (no MSAAppId).\n", req->title_id );
 
-    token_len = strlen( params.token );
-    sig_len = strlen( params.signature );
-    size = sizeof(*data) + token_len + 1 + (sig_len ? sig_len + 1 : 0);
-    if (!(data = calloc( 1, size )))
-    {
-        xgr_async_complete( async, E_OUTOFMEMORY, NULL );
-        return S_OK;
-    }
-
-    token_copy = (char *)(data + 1);
-    memcpy( token_copy, params.token, token_len + 1 );
-    data->tokenSize = token_len + 1;
-    data->token = token_copy;
-
-    if (sig_len)
-    {
-        sig_copy = token_copy + token_len + 1;
-        memcpy( sig_copy, params.signature, sig_len + 1 );
-        data->signatureSize = sig_len + 1;
-        data->signature = sig_copy;
-    }
-
-    TRACE( "issued a token for %s %s%s.\n", debugstr_a( method ), debugstr_a( url ),
-           sig_len ? " (signed)" : "" );
-    xgr_async_complete_ex( async, S_OK, data, size );
-    return S_OK;
-}
-
-static HRESULT token_and_signature_result( XAsyncBlock *async, SIZE_T buffer_size, void *buffer,
-                                           XUserGetTokenAndSignatureData **ptr_to_buffer, SIZE_T *buffer_used )
-{
-    XUserGetTokenAndSignatureData *data;
-    void *payload;
-    SIZE_T size;
-    HRESULT hr;
-
-    if (!async) return E_INVALIDARG;
-    if (!xgr_async_completed( async, &hr, &payload )) return E_PENDING;
-    if (FAILED(hr)) return hr;
-    if (!(data = payload)) return E_UNEXPECTED;
-
-    size = sizeof(*data) + data->tokenSize + data->signatureSize;
-    if (buffer_used) *buffer_used = size;
-    if (!buffer) return S_OK;
-    if (buffer_size < size) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
-
-    /* Copy the block and re-point its pointer at the caller's copy. */
-    memcpy( buffer, data, size );
-    ((XUserGetTokenAndSignatureData *)buffer)->token = (char *)buffer + sizeof(*data);
-    ((XUserGetTokenAndSignatureData *)buffer)->signature =
-        data->signatureSize ? (char *)buffer + sizeof(*data) + data->tokenSize : NULL;
-    if (ptr_to_buffer) *ptr_to_buffer = buffer;
-    return S_OK;
+    hr = IXThreadingImpl_XAsyncBegin( x_threading_impl, async, req, wide ? &token_utf16_identity : &token_identity,
+                                      "XUserGetTokenAndSignature", token_provider );
+    if (FAILED(hr)) token_request_free( req );
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureAsync( IXUserImpl6 *iface, XUserHandle user, XUserGetTokenAndSignatureOptions options, const char *method, const char *url, SIZE_T headerCount, const XUserGetTokenAndSignatureHttpHeader *headers, SIZE_T bodySize, const void *bodyBuffer, XAsyncBlock *async )
 {
     TRACE( "iface %p, user %p, options %d, method %s, url %s, async %p.\n",
            iface, user, options, debugstr_a( method ), debugstr_a( url ), async );
-    return token_and_signature_async( async, method, url, bodySize, bodyBuffer );
+    return token_and_signature_async( async, options, method, url, bodySize, bodyBuffer, FALSE );
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResultSize( IXUserImpl6 *iface, XAsyncBlock *async, SIZE_T *bufferSize )
 {
     TRACE( "iface %p, async %p, bufferSize %p.\n", iface, async, bufferSize );
-    return token_and_signature_result( async, 0, NULL, NULL, bufferSize );
+    return IXThreadingImpl_XAsyncGetResultSize( x_threading_impl, async, bufferSize );
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureResult( IXUserImpl6 *iface, XAsyncBlock *async, SIZE_T bufferSize, void *buffer, XUserGetTokenAndSignatureData **ptrToBuffer, SIZE_T *bufferUsed )
 {
+    HRESULT hr;
+
     TRACE( "iface %p, async %p, bufferSize %Iu, buffer %p.\n", iface, async, bufferSize, buffer );
-    return token_and_signature_result( async, bufferSize, buffer, ptrToBuffer, bufferUsed );
+    if (!buffer && bufferSize) return E_INVALIDARG;
+    hr = IXThreadingImpl_XAsyncGetResult( x_threading_impl, async, &token_identity, bufferSize, buffer, bufferUsed );
+    if (SUCCEEDED(hr) && ptrToBuffer) *ptrToBuffer = buffer;
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl6 *iface, XUserHandle user, XUserGetTokenAndSignatureOptions options, const WCHAR *method, const WCHAR *url, SIZE_T headerCount, const XUserGetTokenAndSignatureUtf16HttpHeader *headers, SIZE_T bodySize, const void *bodyBuffer, XAsyncBlock *async )
@@ -521,64 +847,31 @@ static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Async( IXUserImpl6 *i
     /* The caller's method, not "GET": a signature computed over the wrong verb
      * is a signature the service rejects, and a POST signed as a GET fails in a
      * way that looks like the token being wrong. */
-    hr = token_and_signature_async( async, method_a ? method_a : "GET", url_a, bodySize, bodyBuffer );
+    hr = token_and_signature_async( async, options, method_a ? method_a : "GET", url_a, bodySize, bodyBuffer, TRUE );
     free( method_a );
     free( url_a );
     return hr;
 }
 
-/* The async payload is UTF-8 for both entry points. The Unicode result must
- * convert the strings, not reinterpret that payload as WCHAR pointers. Both
- * the result buffer size and the documented token/signature counts are bytes. */
-static HRESULT token_and_signature_utf16_result( XAsyncBlock *async, SIZE_T buffer_size, void *buffer,
-                                                 XUserGetTokenAndSignatureUtf16Data **result, SIZE_T *used )
-{
-    XUserGetTokenAndSignatureData *data;
-    XUserGetTokenAndSignatureUtf16Data *wide = buffer;
-    void *payload;
-    SIZE_T size;
-    int token_count, signature_count = 0;
-    WCHAR *token, *signature;
-    HRESULT hr;
-
-    if (!async) return E_INVALIDARG;
-    if (!xgr_async_completed( async, &hr, &payload )) return E_PENDING;
-    if (FAILED(hr)) return hr;
-    if (!(data = payload)) return E_UNEXPECTED;
-    if (!(token_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, data->token, -1, NULL, 0 )))
-        return HRESULT_FROM_WIN32( GetLastError() );
-    if (data->signatureSize &&
-        !(signature_count = MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, data->signature, -1, NULL, 0 )))
-        return HRESULT_FROM_WIN32( GetLastError() );
-    size = sizeof(*wide) + (token_count + signature_count) * sizeof(WCHAR);
-    if (used) *used = size;
-    if (!buffer) return S_OK;
-    if (buffer_size < size) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
-
-    token = (WCHAR *)(wide + 1);
-    signature = signature_count ? token + token_count : NULL;
-    MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, data->token, -1, token, token_count );
-    if (signature)
-        MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, data->signature, -1, signature, signature_count );
-    wide->tokenCount = token_count * sizeof(WCHAR);
-    wide->signatureCount = signature_count * sizeof(WCHAR);
-    wide->token = token;
-    wide->signature = signature;
-    if (result) *result = wide;
-    return S_OK;
-}
-
+/* Both the result buffer size and the documented token/signature counts are
+ * bytes; the strings are converted from the service's UTF-8 when DoWork
+ * finishes, so the size reported is exact. */
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16ResultSize( IXUserImpl6 *iface, XAsyncBlock *async, SIZE_T *bufferSize )
 {
     TRACE( "iface %p, async %p, bufferSize %p.\n", iface, async, bufferSize );
     if (!bufferSize) return E_INVALIDARG;
-    return token_and_signature_utf16_result( async, 0, NULL, NULL, bufferSize );
+    return IXThreadingImpl_XAsyncGetResultSize( x_threading_impl, async, bufferSize );
 }
 
 static HRESULT WINAPI x_user_XUserGetTokenAndSignatureUtf16Result( IXUserImpl6 *iface, XAsyncBlock *async, SIZE_T bufferSize, void *buffer, XUserGetTokenAndSignatureUtf16Data **ptrToBuffer, SIZE_T *bufferUsed )
 {
+    HRESULT hr;
+
     TRACE( "iface %p, async %p, bufferSize %Iu, buffer %p.\n", iface, async, bufferSize, buffer );
-    return token_and_signature_utf16_result( async, bufferSize, buffer, ptrToBuffer, bufferUsed );
+    if (!buffer && bufferSize) return E_INVALIDARG;
+    hr = IXThreadingImpl_XAsyncGetResult( x_threading_impl, async, &token_utf16_identity, bufferSize, buffer, bufferUsed );
+    if (SUCCEEDED(hr) && ptrToBuffer) *ptrToBuffer = buffer;
+    return hr;
 }
 
 static HRESULT WINAPI x_user_XUserResolveIssueWithUiAsync( IXUserImpl6 *iface, XUserHandle user, const char *url, XAsyncBlock *async )
@@ -605,10 +898,12 @@ static HRESULT WINAPI x_user_XUserResolveIssueWithUiUtf16Result( IXUserImpl6 *if
     return E_NOTIMPL;
 }
 
-/* Profile-mode events poll authenticated state on the Work port and deliver
- * notifications on the caller's Completion port. Registration owns one ref,
- * polling and each queued notification own another. Unregister stops delivery
- * even if a slow Store request is still finishing. */
+/* Profile-mode change notifications. The role pollers above decide when the
+ * state changed; a watch only remembers what it last told the title and
+ * delivers the news on the caller's Completion port -- nothing is ever run on
+ * the caller's Work port. Registration owns one ref, each queued notification
+ * and each poller pass another. Unregister stops delivery even if a slow
+ * Store request is still finishing. */
 struct role_watch
 {
     struct role_watch *next;
@@ -621,13 +916,18 @@ struct role_watch
     XStoreGameLicenseChangedCallback *store_callback;
     CRITICAL_SECTION lock;
     CONDITION_VARIABLE idle;
-    BOOL stopped, state;
+    BOOL stopped, state, known;
     DWORD callback_thread;
 };
 struct role_notification { struct role_watch *watch; BOOL state; };
 static SRWLOCK role_watches_lock = SRWLOCK_INIT;
 static struct role_watch *role_watches;
 static UINT64 role_watch_next_token = 0x10000;
+
+static enum role_source role_watch_source( enum xgr_role_watch_kind kind )
+{
+    return kind == XGR_ROLE_WATCH_USER ? ROLE_SOURCE_ACCOUNTS : ROLE_SOURCE_ENTITLEMENT;
+}
 
 static void role_watch_release( struct role_watch *watch )
 {
@@ -662,50 +962,70 @@ static void CALLBACK role_watch_notify( void *context, BOOLEAN cancelled )
     role_watch_release(watch);
 }
 
-static void CALLBACK role_watch_poll( void *context, BOOLEAN cancelled )
+/* Compare a definitive state with what the watch last saw, and queue the
+ * notification if it changed. A watch registered while the state was unknown
+ * takes its first answer as the baseline. */
+static void role_watch_apply( struct role_watch *watch, BOOL state )
 {
-    struct role_watch *watch = context;
     struct role_notification *notification;
-    struct account_roles_params roles;
-    struct store_entitlement_params entitlement = {{0}};
-    BOOL stopped, state, changed;
+    BOOL changed;
     HRESULT hr;
 
     EnterCriticalSection(&watch->lock);
-    stopped = cancelled || watch->stopped;
-    LeaveCriticalSection(&watch->lock);
-    if (stopped) { role_watch_release(watch); return; }
-    if (watch->kind == XGR_ROLE_WATCH_USER)
-        state = !XGR_UNIX_CALL(account_roles,&roles) && roles.player_signed_in;
-    else
-    {
-        state = xgr_config_element("StoreId",entitlement.store_id,sizeof(entitlement.store_id)) &&
-            !XGR_UNIX_CALL(store_entitlement,&entitlement) && entitlement.active;
-    }
-    EnterCriticalSection(&watch->lock);
-    stopped = watch->stopped;
-    changed = !stopped && state != watch->state;
+    if (watch->stopped) { LeaveCriticalSection(&watch->lock); return; }
+    changed = watch->known && state != watch->state;
+    watch->known = TRUE;
     watch->state = state;
-    if (changed && (watch->kind != XGR_ROLE_WATCH_PACKAGE || !state) &&
-        (notification = malloc(sizeof(*notification))))
+    if (!changed || (watch->kind == XGR_ROLE_WATCH_PACKAGE && state) ||
+        !(notification = malloc(sizeof(*notification))))
     {
-        notification->watch = watch;
-        notification->state = state;
-        InterlockedIncrement(&watch->refs);
-        /* Submit outside the lock: Immediate queues may invoke reentrantly. */
         LeaveCriticalSection(&watch->lock);
-        hr = IXThreadingImpl_XTaskQueueSubmitCallback(x_threading_impl,watch->queue,XTaskQueuePort_Completion,notification,role_watch_notify);
-        if (FAILED(hr)) { free(notification); role_watch_release(watch); }
+        return;
     }
-    else LeaveCriticalSection(&watch->lock);
-    if (!stopped && SUCCEEDED(IXThreadingImpl_XTaskQueueSubmitDelayedCallback(x_threading_impl,
-        watch->queue,XTaskQueuePort_Work,1000,watch,role_watch_poll))) return;
-    role_watch_release(watch);
+    notification->watch = watch;
+    notification->state = state;
+    InterlockedIncrement(&watch->refs);
+    /* Submit outside the lock: Immediate queues may invoke reentrantly. */
+    LeaveCriticalSection(&watch->lock);
+    hr = IXThreadingImpl_XTaskQueueSubmitCallback(x_threading_impl,watch->queue,XTaskQueuePort_Completion,notification,role_watch_notify);
+    if (FAILED(hr)) { free(notification); role_watch_release(watch); }
+}
+
+static void role_watches_update( enum role_source source )
+{
+    struct role_watch **list = NULL, **grown, *watch;
+    struct account_roles_params roles;
+    SIZE_T count = 0, capacity = 0, i;
+    UINT32 active;
+
+    if (!role_state_peek(source,&roles,&active)) return;
+    /* Take a reference on each watch and let go of the list before calling
+     * out: a notification on an Immediate queue may unregister from inside. */
+    AcquireSRWLockShared(&role_watches_lock);
+    for (watch = role_watches; watch; watch = watch->next)
+    {
+        if (role_watch_source(watch->kind) != source) continue;
+        if (count == capacity)
+        {
+            capacity = capacity ? capacity * 2 : 8;
+            if (!(grown = realloc(list,capacity * sizeof(*list)))) break;
+            list = grown;
+        }
+        InterlockedIncrement(&watch->refs);
+        list[count++] = watch;
+    }
+    ReleaseSRWLockShared(&role_watches_lock);
+    for (i = 0; i < count; i++)
+    {
+        role_watch_apply(list[i],source == ROLE_SOURCE_ACCOUNTS ? roles.player_signed_in : active);
+        role_watch_release(list[i]);
+    }
+    free(list);
 }
 
 HRESULT xgr_role_watch_register( enum xgr_role_watch_kind kind, void *owner, XTaskQueueHandle queue,
     void *context, XUserChangeEventCallback *user_callback, XStoreGameLicenseChangedCallback *store_callback,
-    BOOL initial, XTaskQueueRegistrationToken *token )
+    int initial, XTaskQueueRegistrationToken *token )
 {
     struct role_watch *watch;
     HRESULT hr;
@@ -715,22 +1035,17 @@ HRESULT xgr_role_watch_register( enum xgr_role_watch_kind kind, void *owner, XTa
     { free(watch); return hr; }
     InitializeCriticalSection(&watch->lock);
     InitializeConditionVariable(&watch->idle);
-    watch->refs = 2; /* registration plus polling chain */
+    watch->refs = 1; /* the registration */
     watch->kind = kind; watch->owner = owner; watch->context = context;
-    watch->user_callback = user_callback; watch->store_callback = store_callback; watch->state = initial;
+    watch->user_callback = user_callback; watch->store_callback = store_callback;
+    watch->known = initial >= 0; watch->state = initial > 0;
     AcquireSRWLockExclusive(&role_watches_lock);
     watch->token = ++role_watch_next_token;
     watch->next = role_watches; role_watches = watch;
     token->token = watch->token;
     ReleaseSRWLockExclusive(&role_watches_lock);
-    hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback(x_threading_impl,watch->queue,
-        XTaskQueuePort_Work,1000,watch,role_watch_poll);
-    if (FAILED(hr))
-    {
-        xgr_role_watch_unregister(kind,owner,*token,TRUE);
-        role_watch_release(watch);
-    }
-    return hr;
+    role_source_want(role_watch_source(kind),1);
+    return S_OK;
 }
 
 BOOLEAN xgr_role_watch_unregister( enum xgr_role_watch_kind kind, void *owner,
@@ -744,6 +1059,7 @@ BOOLEAN xgr_role_watch_unregister( enum xgr_role_watch_kind kind, void *owner,
         { watch = *link; *link = watch->next; break; }
     ReleaseSRWLockExclusive(&role_watches_lock);
     if (!watch) return TRUE;
+    role_source_want(role_watch_source(kind),-1);
     EnterCriticalSection(&watch->lock);
     watch->stopped = TRUE;
     while (wait && watch->callback_thread && watch->callback_thread != GetCurrentThreadId())
@@ -777,7 +1093,7 @@ static HRESULT WINAPI x_user_XUserRegisterForChangeEvent( IXUserImpl6 *iface, XT
     TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
     if (account_roles_enabled())
         return xgr_role_watch_register(XGR_ROLE_WATCH_USER,NULL,queue,context,callback,NULL,
-            !XGR_UNIX_CALL(account_roles,&roles) && roles.player_signed_in,token);
+            role_state_get(ROLE_SOURCE_ACCOUNTS,TRUE,&roles,NULL) ? (int)roles.player_signed_in : -1,token);
     /* The legacy local user never changes. */
     if (token) token->token = 1;
     return S_OK;
@@ -838,7 +1154,7 @@ static BOOLEAN WINAPI x_user_XUserIsStoreUser( IXUserImpl6 *iface, XUserHandle u
 
     TRACE( "iface %p, user %p.\n", iface, user );
     if (account_roles_enabled())
-        return is_local_user(user) && !XGR_UNIX_CALL(account_roles,&roles) && roles.same_store_user;
+        return is_local_user(user) && role_state_get(ROLE_SOURCE_ACCOUNTS,TRUE,&roles,NULL) && roles.same_store_user;
     return is_local_user( user );  /* the local user owns the title from the store */
 }
 
@@ -974,6 +1290,7 @@ static ULONG WINAPI x_user_gamertag_Release( IXUserGamertagImpl *iface )
 static HRESULT WINAPI x_user_gamertag_XUserGetGamertag( IXUserGamertagImpl *iface, XUserHandle user, XUserGamertagComponent gamertagComponent, SIZE_T gamertagSize, char *gamertag, SIZE_T *gamertagUsed )
 {
     static const char classic[] = "Player", modern[] = "Player", suffix[] = "", unique[] = "Player#0000";
+    char live[XGR_IDENTITY_MAX];
     const char *value;
     SIZE_T len;
 
@@ -983,10 +1300,9 @@ static HRESULT WINAPI x_user_gamertag_XUserGetGamertag( IXUserGamertagImpl *ifac
     /* Report the signed-in account's own gamertag when there is one. A classic
      * gamertag has no modern suffix, so every component but the suffix is just
      * the tag itself. */
-    ensure_live_identity();
-    if (live_identity.gamertag[0])
+    if (get_live_identity( NULL, live, sizeof(live) ) && live[0])
     {
-        value = (gamertagComponent == XUserGamertagComponent_ModernSuffix) ? "" : live_identity.gamertag;
+        value = (gamertagComponent == XUserGamertagComponent_ModernSuffix) ? "" : live;
         len = strlen( value ) + 1;
         if (gamertagSize < len) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
         memcpy( gamertag, value, len );
