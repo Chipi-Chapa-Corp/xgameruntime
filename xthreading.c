@@ -74,6 +74,7 @@ static ULONG WINAPI x_threading_Release( IXThreadingImpl *iface )
 struct x_task_queue;
 struct x_queue_port;
 struct x_async_op;
+struct x_pending_completion;
 static BOOL deliver_one_completion( XTaskQueueHandle queue, XTaskQueuePort port, BOOL own_only );
 static BOOL dispatch_manual_work( XTaskQueueHandle queue, XTaskQueuePort port );
 static XTaskQueueDispatchMode work_mode_for( XTaskQueueHandle queue );
@@ -101,6 +102,8 @@ struct x_completion_route
 
 static void capture_completion_route( const XAsyncBlock *async, struct x_completion_route *route );
 static void deliver_completion( const struct x_completion_route *route, struct x_async_op *keep_alive );
+static struct x_pending_completion *prepare_waited_completion( const struct x_completion_route *route );
+static void dispatch_completion( struct x_pending_completion *item, XTaskQueueDispatchMode mode );
 
 /* Somewhere to block until an operation finishes or a terminated queue goes
  * quiet. One condition variable serves every waiter: waits are rare and each
@@ -116,6 +119,9 @@ static CRITICAL_SECTION_DEBUG wait_cs_debug =
 static CRITICAL_SECTION wait_cs = { &wait_cs_debug, -1, 0, 0, 0, 0 };
 static CONDITION_VARIABLE wait_cv = CONDITION_VARIABLE_INIT;
 static LONG waiters;
+static struct list waited_callbacks = LIST_INIT( waited_callbacks );
+static LONG waited_callback_count;
+static BOOL callback_blocks_wait( const XAsyncBlock *async );
 
 /* The caller has just made its progress visible with an interlocked
  * operation, and a waiter registers itself with one before it checks, so
@@ -138,6 +144,11 @@ static BOOL async_block_completed( const XAsyncBlock *async, HRESULT *hr, void *
     if (hr) *hr = (HRESULT)(ULONG_PTR)async->internal[1];
     if (payload) *payload = async->internal[2];
     return TRUE;
+}
+
+static BOOL async_wait_completed( const XAsyncBlock *async, HRESULT *hr )
+{
+    return async_block_completed( async, hr, NULL ) && !callback_blocks_wait( async );
 }
 
 static BOOL WINAPI init_manual_dispatch( INIT_ONCE *once, void *param, void **context )
@@ -164,8 +175,8 @@ static HRESULT WINAPI x_threading_XAsyncGetStatus( IXThreadingImpl *iface, XAsyn
     TRACE( "iface %p, asyncBlock %p, wait %d.\n", iface, asyncBlock, wait );
 
     if (!asyncBlock) return E_INVALIDARG;
-    if (async_block_completed( asyncBlock, &hr, NULL )) return hr;
-    if (!wait) return E_PENDING;
+    if (!wait) return async_block_completed( asyncBlock, &hr, NULL ) ? hr : E_PENDING;
+    if (async_wait_completed( asyncBlock, &hr )) return hr;
 
     /* wait means "block until the operation finishes", for as long as that
      * takes. This used to give up after 30000 polls and return E_PENDING:
@@ -184,11 +195,11 @@ static HRESULT WINAPI x_threading_XAsyncGetStatus( IXThreadingImpl *iface, XAsyn
     {
         BOOL delivered;
 
-        if (async_block_completed( asyncBlock, &hr, NULL )) break;
+        if (async_wait_completed( asyncBlock, &hr )) break;
         LeaveCriticalSection( &wait_cs );
         delivered = deliver_one_completion( asyncBlock->queue, XTaskQueuePort_Completion, FALSE );
         EnterCriticalSection( &wait_cs );
-        if (delivered || async_block_completed( asyncBlock, &hr, NULL )) continue;
+        if (delivered || async_wait_completed( asyncBlock, &hr )) continue;
 
         /* Woken when any result is published or a completion is parked; the
          * timeout only bounds how stale a missed one can get. */
@@ -377,6 +388,7 @@ static void complete_op_without_result( struct x_async_op *op, HRESULT hr )
 static void x_threading_XAsyncComplete_helper( XAsyncBlock *async, HRESULT result, SIZE_T required_size )
 {
     struct x_completion_route route;
+    struct x_pending_completion *waited;
     struct x_async_op *op, *drop = NULL;
     BOOL defer = FALSE;
 
@@ -446,8 +458,10 @@ static void x_threading_XAsyncComplete_helper( XAsyncBlock *async, HRESULT resul
     /* Store the result in the block, then deliver the callback according to
      * the queue's dispatch mode -- by the route the operation began with,
      * because once the result is stored the block is no longer ours to read. */
+    waited = defer ? NULL : prepare_waited_completion( &route );
     store_async_result( async, result, NULL, required_size );
-    if (!defer) deliver_completion( &route, NULL );
+    if (waited) dispatch_completion( waited, route.mode );
+    else if (!defer) deliver_completion( &route, NULL );
 }
 
 static void async_op_invoke( struct x_async_op *op, XAsyncOp which, SIZE_T buffer_size, void *buffer )
@@ -1192,13 +1206,36 @@ static BOOL running_on( const struct x_task_queue *queue )
 struct x_pending_completion
 {
     struct list entry;
+    struct list wait_entry;
     XAsyncBlock *async;
     XAsyncCompletionRoutine *callback;
     struct x_async_op *keep_alive;
     struct x_queue_port *port;
     XTaskQueueHandle origin;
     struct x_task_queue *owner;     /* the queue the block named, which waits for this */
+    DWORD callback_thread;
+    BOOL wait_for_callback;
 };
+
+static BOOL callback_blocks_wait( const XAsyncBlock *async )
+{
+    const struct x_pending_completion *item;
+    DWORD thread;
+    BOOL pending = FALSE;
+
+    if (!InterlockedCompareExchange( &waited_callback_count, 0, 0 )) return FALSE;
+    thread = GetCurrentThreadId();
+    EnterCriticalSection( &wait_cs );
+    LIST_FOR_EACH_ENTRY( item, &waited_callbacks, struct x_pending_completion, wait_entry )
+    {
+        if (item->async != async) continue;
+        /* A callback can query the status of the operation that called it. */
+        pending = item->callback_thread != thread;
+        break;
+    }
+    LeaveCriticalSection( &wait_cs );
+    return pending;
+}
 
 /* Set once a title actually pumps a queue. Until then a Manual completion has
  * nothing that will ever drain it -- see xgr_async_complete_ex. */
@@ -1253,9 +1290,23 @@ static void invoke_async_completion( struct x_pending_completion *item )
     struct x_task_queue *owner = item->owner;
     struct x_running_frame frame;
 
+    if (item->wait_for_callback)
+    {
+        EnterCriticalSection( &wait_cs );
+        item->callback_thread = GetCurrentThreadId();
+        LeaveCriticalSection( &wait_cs );
+    }
     enter_frame( &frame, owner );
     item->callback( item->async );
     leave_frame( &frame );
+    if (item->wait_for_callback)
+    {
+        EnterCriticalSection( &wait_cs );
+        list_remove( &item->wait_entry );
+        InterlockedDecrement( &waited_callback_count );
+        LeaveCriticalSection( &wait_cs );
+        wake_waiters();
+    }
     release_async_op( item->keep_alive );
     free( item );
     if (owner) queue_finish( owner );
@@ -1301,12 +1352,13 @@ static void store_async_result( XAsyncBlock *async, HRESULT hr, void *payload, S
     wake_waiters();
 }
 
-static void deliver_completion( const struct x_completion_route *route, struct x_async_op *keep_alive )
+static struct x_pending_completion *prepare_completion( const struct x_completion_route *route,
+                                                        struct x_async_op *keep_alive )
 {
     struct x_pending_completion *item;
 
-    if (!route->callback) return;
-    if (!(item = calloc( 1, sizeof(*item) ))) return;
+    if (!route->callback) return NULL;
+    if (!(item = calloc( 1, sizeof(*item) ))) return NULL;
     item->async = route->async;
     item->callback = route->callback;
     item->keep_alive = keep_alive;
@@ -1314,7 +1366,11 @@ static void deliver_completion( const struct x_completion_route *route, struct x
     item->origin = route->origin;
     if (keep_alive) InterlockedIncrement( &keep_alive->ref );
     if ((item->owner = (struct x_task_queue *)route->queue)) queue_hold( item->owner );
+    return item;
+}
 
+static void dispatch_completion( struct x_pending_completion *item, XTaskQueueDispatchMode mode )
+{
     /* A Manual queue is the title's to pump. Bedrock, though, creates Manual
      * queues, hands them to XSAPI and never calls XTaskQueueDispatch even once,
      * so everything parked on one is lost: across a run 42 Xbl* operations were
@@ -1328,7 +1384,7 @@ static void deliver_completion( const struct x_completion_route *route, struct x
      * game licence on such a queue and shuts down cleanly when it times out).
      * Hand those to the thread pool rather than running them inline, which
      * would re-enter the caller's own *Async() frame. */
-    if (route->mode != XTaskQueueDispatchMode_Manual ||
+    if (mode != XTaskQueueDispatchMode_Manual ||
         (!strict_manual_dispatch() && !InterlockedCompareExchange( &queue_ever_dispatched, 0, 0 )))
     {
         HANDLE thread;
@@ -1344,7 +1400,7 @@ static void deliver_completion( const struct x_completion_route *route, struct x
             CloseHandle( thread );
             return;
         }
-        ERR( "could not deliver completion for asyncBlock %p.\n", route->async );
+        ERR( "could not deliver completion for asyncBlock %p.\n", item->async );
     }
 
     EnterCriticalSection( &pending_cs );
@@ -1355,6 +1411,12 @@ static void deliver_completion( const struct x_completion_route *route, struct x
     LeaveCriticalSection( &pending_cs );
     /* XAsyncGetStatus(wait) delivers these while it blocks. */
     wake_waiters();
+}
+
+static void deliver_completion( const struct x_completion_route *route, struct x_async_op *keep_alive )
+{
+    struct x_pending_completion *item = prepare_completion( route, keep_alive );
+    if (item) dispatch_completion( item, route->mode );
 }
 
 static void CALLBACK invoke_termination( XAsyncBlock *async )
@@ -1381,14 +1443,47 @@ static void deliver_termination( struct x_task_queue *queue, struct x_terminate_
     deliver_completion( &route, NULL );
 }
 
+static BOOL WINAPI init_blocking_callbacks( INIT_ONCE *once, void *param, void **context )
+{
+    char value[2];
+
+    *context = (void *)(ULONG_PTR)(GetEnvironmentVariableA( "XGR_WAIT_FOR_ASYNC_CALLBACKS", value,
+                                 sizeof(value) ) == 1 && value[0] == '1' ? 4 : 0);
+    return TRUE;
+}
+
+static struct x_pending_completion *prepare_waited_completion( const struct x_completion_route *route )
+{
+    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+    struct x_pending_completion *item;
+    void *enabled;
+
+    if (!route->callback || (route->mode != XTaskQueueDispatchMode_ThreadPool &&
+                             route->mode != XTaskQueueDispatchMode_SerializedThreadPool)) return NULL;
+    InitOnceExecuteOnce( &once, init_blocking_callbacks, NULL, &enabled );
+    if (!enabled || !(item = prepare_completion( route, NULL ))) return NULL;
+
+    /* Publish the result for the callback to read, but keep a blocking caller
+     * waiting until the callback has written its user handle or token. */
+    item->wait_for_callback = TRUE;
+    EnterCriticalSection( &wait_cs );
+    list_add_head( &waited_callbacks, &item->wait_entry );
+    InterlockedIncrement( &waited_callback_count );
+    LeaveCriticalSection( &wait_cs );
+    return item;
+}
+
 void xgr_async_complete_ex( XAsyncBlock *async, HRESULT hr, void *payload, SIZE_T result_size )
 {
     struct x_completion_route route;
+    struct x_pending_completion *waited;
 
     if (!async) return;
     capture_completion_route( async, &route );
+    waited = prepare_waited_completion( &route );
     store_async_result( async, hr, payload, result_size );
-    deliver_completion( &route, NULL );
+    if (waited) dispatch_completion( waited, route.mode );
+    else deliver_completion( &route, NULL );
 }
 
 void xgr_async_complete( XAsyncBlock *async, HRESULT hr, void *payload )
